@@ -1,0 +1,8 @@
+fastapi
+pydantic
+scikit-learn
+statsmodels
+joblib
+pytest
+uvicorn
+numpy
