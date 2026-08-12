@@ -67,11 +67,11 @@ async def test_train_model_success(model_manager, sample_data, valid_config):
     assert metrics["p_values"]["feature2"] < 0.05
     
     # Verify model file exists
-    assert Path(model_path).exists()
+    assert Path(metrics["model_path"]).exists()
     
     # Verify model can be loaded
-    loaded_model = joblib.load(model_path)
-    assert hasattr(loaded_model, "predict")
+    loaded_model = joblib.load(metrics["model_path"])
+    assert hasattr(loaded_model["sklearn_model"], "predict")
 
 
 @pytest.mark.asyncio
@@ -127,6 +127,6 @@ async def test_train_model_serialization_and_reproducibility(model_manager, samp
     # Load and verify model works
     loaded_model = joblib.load(metrics1["model_path"])
     test_data = sample_data[valid_config.feature_columns].iloc[:5]
-    predictions = loaded_model.predict(test_data)
+    predictions = loaded_model["sklearn_model"].predict(test_data)
     assert len(predictions) == 5
     assert all(np.isfinite(predictions))
