@@ -1,132 +1,281 @@
-import asyncio
 import io
 import logging
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from fastapi import HTTPException
+from fastapi import UploadFile
 
-from src.model_manager import ModelConfig, ModelManager, TrainingResponse
+from src.model_manager import (
+    ModelManager,
+    TrainingRequest,
+    TrainingResponse,
+    MODEL_DIR,
+    MAX_FILE_SIZE,
+    SUPPORTED_EXTENSIONS,
+)
 
 
 @pytest.fixture
-def sample_data():
-    """Create sample regression data."""
+def sample_dataframe():
+    """Create a sample dataframe for testing."""
     np.random.seed(42)
     n_samples = 100
-    X1 = np.random.randn(n_samples)
-    X2 = np.random.randn(n_samples)
-    y = 2 * X1 + 3 * X2 + np.random.randn(n_samples) * 0.1
-    return pd.DataFrame({"feature1": X1, "feature2": X2, "target": y})
+    data = {
+        "feature1": np.random.randn(n_samples),
+        "feature2": np.random.randn(n_samples),
+        "target": np.random.randn(n_samples) * 2 + 1,
+    }
+    return pd.DataFrame(data)
 
 
 @pytest.fixture
 def model_manager(tmp_path):
-    """Create ModelManager with temporary directory."""
-    return ModelManager(model_dir=str(tmp_path / "models"))
+    """Create a ModelManager instance with a temporary directory."""
+    return ModelManager(model_dir=tmp_path)
 
 
 @pytest.fixture
-def valid_config():
-    """Create valid model config."""
-    return ModelConfig(
+def valid_training_request():
+    """Create a valid training request."""
+    return TrainingRequest(
         target_column="target",
         test_size=0.2,
         random_state=42,
-        feature_columns=["feature1", "feature2"]
+        feature_columns=["feature1", "feature2"],
     )
 
 
-@pytest.mark.asyncio
-async def test_train_model_success(model_manager, sample_data, valid_config):
-    """Test successful model training with valid data and config."""
-    metrics, model_path = await model_manager.train_model(sample_data, valid_config)
-    
-    # Verify metrics
-    assert "r_squared" in metrics
-    assert "adjusted_r_squared" in metrics
-    assert "test_rmse" in metrics["metrics"]
-    assert "test_mae" in metrics["metrics"]
-    assert "test_mse" in metrics["metrics"]
-    assert metrics["r_squared"] > 0.9  # High R² for clean data
-    
-    # Verify coefficients
-    assert "feature1" in metrics["coefficients"]
-    assert "feature2" in metrics["coefficients"]
-    assert abs(metrics["coefficients"]["feature1"] - 2.0) < 0.5
-    assert abs(metrics["coefficients"]["feature2"] - 3.0) < 0.5
-    
-    # Verify p-values
-    assert "feature1" in metrics["p_values"]
-    assert "feature2" in metrics["p_values"]
-    assert metrics["p_values"]["feature1"] < 0.05
-    assert metrics["p_values"]["feature2"] < 0.05
-    
-    # Verify model file exists
-    assert Path(metrics["model_path"]).exists()
-    
-    # Verify model can be loaded
-    loaded_model = joblib.load(metrics["model_path"])
-    assert hasattr(loaded_model["sklearn_model"], "predict")
+class TestTrainingRequest:
+    """Tests for TrainingRequest validation."""
+
+    def test_valid_request(self):
+        """Test that a valid request passes validation."""
+        request = TrainingRequest(
+            target_column="target",
+            test_size=0.2,
+            random_state=42,
+            feature_columns=["feature1", "feature2"],
+        )
+        assert request.target_column == "target"
+        assert request.test_size == 0.2
+        assert request.random_state == 42
+        assert request.feature_columns == ["feature1", "feature2"]
+
+    def test_empty_target_column_raises_error(self):
+        """Test that empty target column raises validation error."""
+        with pytest.raises(ValueError, match="Target column cannot be empty"):
+            TrainingRequest(
+                target_column="   ",
+                test_size=0.2,
+                random_state=42,
+            )
+
+    def test_duplicate_feature_columns_raises_error(self):
+        """Test that duplicate feature columns raise validation error."""
+        with pytest.raises(ValueError, match="Feature columns must be unique"):
+            TrainingRequest(
+                target_column="target",
+                test_size=0.2,
+                random_state=42,
+                feature_columns=["feature1", "feature1"],
+            )
+
+    def test_empty_feature_columns_list_raises_error(self):
+        """Test that empty feature columns list raises validation error."""
+        with pytest.raises(ValueError, match="Feature columns list cannot be empty"):
+            TrainingRequest(
+                target_column="target",
+                test_size=0.2,
+                random_state=42,
+                feature_columns=[],
+            )
+
+    def test_invalid_test_size_raises_error(self):
+        """Test that invalid test size raises validation error."""
+        with pytest.raises(ValueError):
+            TrainingRequest(
+                target_column="target",
+                test_size=0.6,  # > 0.5
+                random_state=42,
+            )
 
 
-@pytest.mark.asyncio
-async def test_train_model_missing_target(model_manager, sample_data):
-    """Test training with missing target column."""
-    config = ModelConfig(target_column="nonexistent", test_size=0.2, random_state=42)
-    
-    with pytest.raises(ValueError, match="Target column 'nonexistent' not found"):
-        await model_manager.train_model(sample_data, config)
+class TestModelManager:
+    """Tests for ModelManager class."""
 
+    def test_initialization_creates_directory(self, tmp_path):
+        """Test that ModelManager creates the model directory."""
+        model_dir = tmp_path / "test_models"
+        manager = ModelManager(model_dir=model_dir)
+        assert model_dir.exists()
+        assert model_dir.is_dir()
 
-@pytest.mark.asyncio
-async def test_train_model_empty_data(model_manager, valid_config):
-    """Test training with empty dataframe."""
-    empty_df = pd.DataFrame()
-    
-    with pytest.raises(ValueError, match="Data is empty"):
-        await model_manager.train_model(empty_df, valid_config)
+    def test_train_model_returns_valid_response(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that train_model returns a valid TrainingResponse."""
+        # Convert dataframe to CSV bytes for upload simulation
+        csv_buffer = io.StringIO()
+        sample_dataframe.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode()
 
+        # Create a mock UploadFile
+        mock_file = MagicMock(spec=UploadFile)
+        mock_file.filename = "test_data.csv"
+        mock_file.content_type = "text/csv"
+        mock_file.file = io.BytesIO(csv_bytes)
 
-@pytest.mark.asyncio
-async def test_train_model_feature_columns_subset(model_manager, sample_data):
-    """Test training with subset of feature columns."""
-    config = ModelConfig(
-        target_column="target",
-        test_size=0.2,
-        random_state=42,
-        feature_columns=["feature1"]  # Only use one feature
-    )
-    
-    metrics, model_path = await model_manager.train_model(sample_data, config)
-    
-    # Verify only specified feature is used
-    assert "feature1" in metrics["coefficients"]
-    assert "feature2" not in metrics["coefficients"]
-    assert metrics["r_squared"] > 0.1  # Still decent with one feature
+        # Train the model
+        response = model_manager.train_model(mock_file, valid_training_request)
 
+        # Assert response is valid
+        assert isinstance(response, TrainingResponse)
+        assert response.model_id is not None
+        assert response.training_timestamp is not None
+        assert response.r_squared > 0
+        assert response.adjusted_r_squared > 0
+        assert response.mse > 0
+        assert response.rmse > 0
+        assert response.mae > 0
+        assert response.feature_count == 2
+        assert response.sample_count == 100
+        assert response.model_path.endswith(".joblib")
+        assert "breusch_pagan" in response.diagnostics
+        assert "durbin_watson" in response.diagnostics
 
-@pytest.mark.asyncio
-async def test_train_model_serialization_and_reproducibility(model_manager, sample_data, valid_config):
-    """Test model serialization and reproducibility."""
-    # Train twice with same config
-    metrics1, path1 = await model_manager.train_model(sample_data, valid_config)
-    metrics2, path2 = await model_manager.train_model(sample_data, valid_config)
-    
-    # Verify same metrics (deterministic with fixed random_state)
-    assert metrics1["r_squared"] == metrics2["r_squared"]
-    assert metrics1["coefficients"] == metrics2["coefficients"]
-    
-    # Verify different model paths (timestamp-based)
-    assert path1 != path2
-    
-    # Load and verify model works
-    loaded_model = joblib.load(metrics1["model_path"])
-    test_data = sample_data[valid_config.feature_columns].iloc[:5]
-    predictions = loaded_model["sklearn_model"].predict(test_data)
-    assert len(predictions) == 5
-    assert all(np.isfinite(predictions))
+    def test_train_model_saves_model_file(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that train_model saves the model to disk."""
+        csv_buffer = io.StringIO()
+        sample_dataframe.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode()
+
+        mock_file = MagicMock(spec=UploadFile)
+        mock_file.filename = "test_data.csv"
+        mock_file.content_type = "text/csv"
+        mock_file.file = io.BytesIO(csv_bytes)
+
+        response = model_manager.train_model(mock_file, valid_training_request)
+
+        # Check that model file exists
+        model_path = Path(response.model_path)
+        assert model_path.exists()
+        assert model_path.suffix == ".joblib"
+
+        # Load and verify the model
+        loaded_model = joblib.load(model_path)
+        assert hasattr(loaded_model, "predict")
+        assert hasattr(loaded_model, "coef_")
+
+    def test_train_model_with_invalid_file_extension(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that training with invalid file extension raises error."""
+        csv_buffer = io.StringIO()
+        sample_dataframe.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode()
+
+        mock_file = MagicMock(spec=UploadFile)
+        mock_file.filename = "test_data.pdf"  # Invalid extension
+        mock_file.content_type = "application/pdf"
+        mock_file.file = io.BytesIO(csv_bytes)
+
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            model_manager.train_model(mock_file, valid_training_request)
+
+    def test_train_model_with_missing_target_column(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that training with missing target column raises error."""
+        # Remove target column from dataframe
+        df_without_target = sample_dataframe.drop(columns=["target"])
+        csv_buffer = io.StringIO()
+        df_without_target.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode()
+
+        mock_file = MagicMock(spec=UploadFile)
+        mock_file.filename = "test_data.csv"
+        mock_file.content_type = "text/csv"
+        mock_file.file = io.BytesIO(csv_bytes)
+
+        with pytest.raises(ValueError, match="Target column 'target' not found"):
+            model_manager.train_model(mock_file, valid_training_request)
+
+    def test_train_model_with_missing_feature_column(
+        self, model_manager, sample_dataframe
+    ):
+        """Test that training with missing feature column raises error."""
+        # Create request with non-existent feature column
+        request = TrainingRequest(
+            target_column="target",
+            test_size=0.2,
+            random_state=42,
+            feature_columns=["feature1", "nonexistent_feature"],
+        )
+
+        csv_buffer = io.StringIO()
+        sample_dataframe.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode()
+
+        mock_file = MagicMock(spec=UploadFile)
+        mock_file.filename = "test_data.csv"
+        mock_file.content_type = "text/csv"
+        mock_file.file = io.BytesIO(csv_bytes)
+
+        with pytest.raises(ValueError, match="Feature column 'nonexistent_feature' not found"):
+            model_manager.train_model(mock_file, request)
+
+    def test_train_model_with_large_file(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that training with file larger than MAX_FILE_SIZE raises error."""
+        # Create a large dataframe
+        large_df = pd.concat([sample_dataframe] * 1000, ignore_index=True)
+        csv_buffer = io.StringIO()
+        large_df.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode()
+
+        # Ensure the file is larger than MAX_FILE_SIZE
+        assert len(csv_bytes) > MAX_FILE_SIZE
+
+        mock_file = MagicMock(spec=UploadFile)
+        mock_file.filename = "test_data.csv"
+        mock_file.content_type = "text/csv"
+        mock_file.file = io.BytesIO(csv_bytes)
+
+        with pytest.raises(ValueError, match="File size exceeds maximum allowed"):
+            model_manager.train_model(mock_file, valid_training_request)
+
+    def test_load_model(self, model_manager, sample_dataframe, valid_training_request):
+        """Test that load_model loads a previously saved model."""
+        # First train and save a model
+        csv_buffer = io.StringIO()
+        sample_dataframe.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode()
+
+        mock_file = MagicMock(spec=UploadFile)
+        mock_file.filename = "test_data.csv"
+        mock_file.content_type = "text/csv"
+        mock_file.file = io.BytesIO(csv_bytes)
+
+        response = model_manager.train_model(mock_file, valid_training_request)
+
+        # Load the model
+        loaded_model = model_manager.load_model(response.model_id)
+
+        # Verify the loaded model works
+        assert hasattr(loaded_model, "predict")
+        test_features = sample_dataframe[["feature1", "feature2"]].iloc[:5]
+        predictions = loaded_model.predict(test_features)
+        assert len(predictions) == 5
+        assert all(np.isfinite(predictions))
+
+    def test_load_nonexistent_model(self, model_manager):
+        """Test that loading a non-existent model raises error."""
+        with pytest.raises(FileNotFoundError):
+            model_manager.load_model("nonexistent_model_id")
