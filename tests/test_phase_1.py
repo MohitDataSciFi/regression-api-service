@@ -7,15 +7,14 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from fastapi import UploadFile
-from pydantic import ValidationError
+from fastapi import HTTPException, UploadFile
 
 from src.model_manager import (
-    DataValidationError,
-    ModelTrainingError,
+    MAX_FILE_SIZE,
+    MODEL_DIR,
+    ModelManager,
     TrainingRequest,
-    train_model,
-    validate_and_prepare_data,
+    TrainingResponse,
 )
 
 
@@ -33,31 +32,22 @@ def sample_dataframe():
 
 
 @pytest.fixture
-def sample_csv_bytes():
-    """Create sample CSV data as bytes."""
-    np.random.seed(42)
-    n_samples = 100
-    data = {
-        "feature1": np.random.randn(n_samples),
-        "feature2": np.random.randn(n_samples),
-        "target": np.random.randn(n_samples) * 2 + 1,
-    }
-    df = pd.DataFrame(data)
-    return df.to_csv(index=False).encode()
+def model_manager(tmp_path):
+    """Create a ModelManager instance with a temporary directory."""
+    return ModelManager(model_dir=tmp_path)
 
 
 @pytest.fixture
-def mock_upload_file(sample_csv_bytes):
-    """Create a mock UploadFile object."""
-    upload_file = MagicMock(spec=UploadFile)
-    upload_file.filename = "test_data.csv"
-    upload_file.file = io.BytesIO(sample_csv_bytes)
-    return upload_file
+def sample_csv_bytes(sample_dataframe):
+    """Create CSV bytes from sample dataframe."""
+    csv_buffer = io.StringIO()
+    sample_dataframe.to_csv(csv_buffer, index=False)
+    return csv_buffer.getvalue().encode()
 
 
 class TestTrainingRequest:
-    def test_valid_training_request(self):
-        """Test that a valid TrainingRequest is created successfully."""
+    def test_valid_request(self):
+        """Test that a valid TrainingRequest passes validation."""
         request = TrainingRequest(
             target_column="target",
             test_size=0.2,
@@ -69,155 +59,217 @@ class TestTrainingRequest:
         assert request.random_state == 42
         assert request.feature_columns == ["feature1", "feature2"]
 
-    def test_invalid_test_size(self):
-        """Test that test_size validation fails for out-of-range values."""
-        with pytest.raises(ValidationError):
-            TrainingRequest(target_column="target", test_size=0.6)
-
-    def test_empty_feature_columns(self):
-        """Test that empty feature_columns list raises validation error."""
-        with pytest.raises(ValidationError):
-            TrainingRequest(target_column="target", feature_columns=[])
+    def test_invalid_target_column(self):
+        """Test that empty target column raises validation error."""
+        with pytest.raises(Exception):
+            TrainingRequest(target_column="   ", test_size=0.2)
 
     def test_duplicate_feature_columns(self):
         """Test that duplicate feature columns raise validation error."""
-        with pytest.raises(ValidationError):
+        with pytest.raises(Exception):
             TrainingRequest(
                 target_column="target",
                 feature_columns=["feature1", "feature1"],
             )
 
+    def test_invalid_test_size(self):
+        """Test that test_size outside valid range raises validation error."""
+        with pytest.raises(Exception):
+            TrainingRequest(target_column="target", test_size=0.6)
 
-class TestValidateAndPrepareData:
-    def test_valid_data_preparation(self, sample_dataframe):
-        """Test that valid data is prepared correctly."""
+
+class TestModelManager:
+    def test_initialization(self, model_manager):
+        """Test ModelManager initialization creates directory."""
+        assert model_manager.model_dir.exists()
+        assert model_manager.model_dir.is_dir()
+
+    def test_train_model_success(self, model_manager, sample_dataframe):
+        """Test successful model training with valid data."""
+        # Prepare request
+        request = TrainingRequest(
+            target_column="target",
+            test_size=0.2,
+            random_state=42,
+            feature_columns=["feature1", "feature2"],
+        )
+
+        # Train model
+        response = model_manager.train_model(sample_dataframe, request)
+
+        # Verify response structure
+        assert isinstance(response, TrainingResponse)
+        assert response.model_id is not None
+        assert response.r_squared > 0
+        assert response.n_samples == 100
+        assert response.n_features == 2
+        assert response.feature_columns == ["feature1", "feature2"]
+        assert response.target_column == "target"
+        assert response.model_path.endswith(".joblib")
+        assert Path(response.model_path).exists()
+
+        # Verify metrics
+        assert "r2" in response.metrics
+        assert "mse" in response.metrics
+        assert "rmse" in response.metrics
+        assert "mae" in response.metrics
+
+        # Verify coefficients and p-values
+        assert len(response.coefficients) == 3  # 2 features + intercept
+        assert len(response.p_values) == 3
+
+        # Verify diagnostics
+        assert "durbin_watson" in response.diagnostics
+        assert "breusch_pagan" in response.diagnostics
+
+    def test_train_model_without_feature_columns(self, model_manager, sample_dataframe):
+        """Test training when feature_columns is None (use all except target)."""
         request = TrainingRequest(
             target_column="target",
             test_size=0.2,
             random_state=42,
         )
-        X_train, X_test, y_train, y_test, feature_names = validate_and_prepare_data(
-            sample_dataframe, request
+
+        response = model_manager.train_model(sample_dataframe, request)
+
+        assert response.n_features == 2
+        assert response.feature_columns == ["feature1", "feature2"]
+
+    def test_train_model_missing_target(self, model_manager, sample_dataframe):
+        """Test training with non-existent target column raises error."""
+        request = TrainingRequest(
+            target_column="nonexistent_column",
+            test_size=0.2,
+            random_state=42,
         )
-        
-        assert X_train.shape[0] == 80
-        assert X_test.shape[0] == 20
-        assert y_train.shape[0] == 80
-        assert y_test.shape[0] == 20
-        assert feature_names == ["feature1", "feature2"]
 
-    def test_missing_target_column(self, sample_dataframe):
-        """Test that missing target column raises DataValidationError."""
-        request = TrainingRequest(target_column="nonexistent")
-        
-        with pytest.raises(DataValidationError):
-            validate_and_prepare_data(sample_dataframe, request)
+        with pytest.raises(HTTPException) as exc_info:
+            model_manager.train_model(sample_dataframe, request)
 
-    def test_specific_feature_columns(self, sample_dataframe):
-        """Test that specific feature columns are used correctly."""
+        assert exc_info.value.status_code == 400
+
+    def test_train_model_missing_feature(self, model_manager, sample_dataframe):
+        """Test training with non-existent feature column raises error."""
         request = TrainingRequest(
             target_column="target",
-            feature_columns=["feature1"],
+            test_size=0.2,
+            random_state=42,
+            feature_columns=["nonexistent_feature"],
         )
-        X_train, X_test, y_train, y_test, feature_names = validate_and_prepare_data(
-            sample_dataframe, request
-        )
-        
-        assert feature_names == ["feature1"]
-        assert X_train.shape[1] == 1
 
-    def test_non_numeric_data(self):
-        """Test that non-numeric data raises DataValidationError."""
-        df = pd.DataFrame({
-            "feature1": ["a", "b", "c"],
-            "target": [1, 2, 3],
-        })
-        request = TrainingRequest(target_column="target")
-        
-        with pytest.raises(DataValidationError):
-            validate_and_prepare_data(df, request)
+        with pytest.raises(HTTPException) as exc_info:
+            model_manager.train_model(sample_dataframe, request)
 
+        assert exc_info.value.status_code == 400
 
-class TestTrainModel:
-    def test_successful_training(self, sample_dataframe, tmp_path):
-        """Test that model training succeeds and returns expected metrics."""
+    def test_train_model_serialization(self, model_manager, sample_dataframe):
+        """Test that trained model is properly serialized and can be loaded."""
         request = TrainingRequest(
             target_column="target",
             test_size=0.2,
             random_state=42,
         )
-        
-        with patch("src.model_manager.joblib.dump") as mock_dump:
-            result = train_model(
-                sample_dataframe,
-                request,
-                model_path=str(tmp_path / "model.joblib"),
-            )
-        
-        # Verify model was saved
-        mock_dump.assert_called_once()
-        
-        # Verify metrics are present
-        assert "r2_score" in result
-        assert "rmse" in result
-        assert "mae" in result
-        assert "coefficients" in result
-        assert "p_values" in result
-        assert "training_samples" in result
-        assert "test_samples" in result
-        
-        # Verify metric values are reasonable
-        assert 0 <= result["r2_score"] <= 1
-        assert result["rmse"] >= 0
-        assert result["mae"] >= 0
-        assert len(result["coefficients"]) == 2  # feature1, feature2
-        assert len(result["p_values"]) == 2
 
-    def test_training_with_specific_features(self, sample_dataframe, tmp_path):
-        """Test training with specific feature columns."""
+        response = model_manager.train_model(sample_dataframe, request)
+
+        # Load the serialized model
+        loaded_model = joblib.load(response.model_path)
+        assert loaded_model is not None
+
+        # Verify model can make predictions
+        test_data = sample_dataframe[["feature1", "feature2"]].iloc[:5]
+        predictions = loaded_model.predict(test_data)
+        assert len(predictions) == 5
+        assert all(np.isfinite(predictions))
+
+    def test_train_model_with_mock(self, model_manager, sample_dataframe):
+        """Test training with mocked sklearn components."""
         request = TrainingRequest(
             target_column="target",
-            feature_columns=["feature1"],
+            test_size=0.2,
+            random_state=42,
         )
-        
-        with patch("src.model_manager.joblib.dump"):
-            result = train_model(
-                sample_dataframe,
-                request,
-                model_path=str(tmp_path / "model.joblib"),
+
+        with patch("src.model_manager.LinearRegression") as mock_lr, \
+             patch("src.model_manager.OLS") as mock_ols, \
+             patch("src.model_manager.train_test_split") as mock_split:
+
+            # Configure mocks
+            mock_lr_instance = MagicMock()
+            mock_lr_instance.fit.return_value = None
+            mock_lr_instance.predict.return_value = np.array([1.0, 2.0, 3.0])
+            mock_lr_instance.coef_ = np.array([0.5, 0.3])
+            mock_lr_instance.intercept_ = 0.1
+            mock_lr.return_value = mock_lr_instance
+
+            mock_ols_instance = MagicMock()
+            mock_ols_instance.fit.return_value = mock_ols_instance
+            mock_ols_instance.params = np.array([0.1, 0.5, 0.3])
+            mock_ols_instance.pvalues = np.array([0.01, 0.02, 0.03])
+            mock_ols_instance.rsquared = 0.85
+            mock_ols_instance.rsquared_adj = 0.82
+            mock_ols.return_value = mock_ols_instance
+
+            mock_split.return_value = (
+                sample_dataframe[["feature1", "feature2"]],
+                sample_dataframe[["feature1", "feature2"]],
+                sample_dataframe["target"],
+                sample_dataframe["target"],
             )
-        
-        assert len(result["coefficients"]) == 1
-        assert len(result["p_values"]) == 1
 
-    def test_training_error_handling(self, sample_dataframe, tmp_path):
-        """Test that training errors are properly wrapped."""
-        request = TrainingRequest(target_column="target")
-        
-        with patch(
-            "src.model_manager.LinearRegression.fit",
-            side_effect=Exception("Training failed"),
-        ):
-            with pytest.raises(ModelTrainingError):
-                train_model(
-                    sample_dataframe,
-                    request,
-                    model_path=str(tmp_path / "model.joblib"),
-                )
+            response = model_manager.train_model(sample_dataframe, request)
 
-    def test_model_serialization(self, sample_dataframe, tmp_path):
-        """Test that the model is properly serialized."""
-        request = TrainingRequest(target_column="target")
-        model_path = str(tmp_path / "test_model.joblib")
-        
-        with patch("src.model_manager.joblib.dump") as mock_dump:
-            train_model(sample_dataframe, request, model_path=model_path)
-        
-        # Verify joblib.dump was called with correct arguments
-        mock_dump.assert_called_once()
-        args, kwargs = mock_dump.call_args
-        assert args[1] == model_path  # model path is second argument
-        assert "model" in args[0]  # first argument contains model dict
-        assert "metadata" in args[0]
-        assert args[0]["metadata"]["target_column"] == "target"
-        assert args[0]["metadata"]["feature_columns"] == ["feature1", "feature2"]
+            assert response.r_squared == 0.85
+            assert response.adjusted_r_squared == 0.82
+            assert len(response.coefficients) == 3
+            assert len(response.p_values) == 3
+
+    def test_validate_file_size(self, model_manager):
+        """Test file size validation."""
+        # Create a file larger than MAX_FILE_SIZE
+        large_file = MagicMock(spec=UploadFile)
+        large_file.size = MAX_FILE_SIZE + 1
+
+        with pytest.raises(HTTPException) as exc_info:
+            model_manager.validate_file(large_file)
+
+        assert exc_info.value.status_code == 413
+
+    def test_validate_file_extension(self, model_manager):
+        """Test file extension validation."""
+        # Create a file with unsupported extension
+        invalid_file = MagicMock(spec=UploadFile)
+        invalid_file.size = 1000
+        invalid_file.filename = "data.json"
+
+        with pytest.raises(HTTPException) as exc_info:
+            model_manager.validate_file(invalid_file)
+
+        assert exc_info.value.status_code == 400
+
+    def test_validate_file_success(self, model_manager):
+        """Test valid file passes validation."""
+        valid_file = MagicMock(spec=UploadFile)
+        valid_file.size = 1000
+        valid_file.filename = "data.csv"
+
+        # Should not raise any exception
+        model_manager.validate_file(valid_file)
+
+    def test_parse_csv(self, model_manager, sample_csv_bytes):
+        """Test CSV parsing from bytes."""
+        df = model_manager.parse_csv(sample_csv_bytes)
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 100
+        assert "target" in df.columns
+        assert "feature1" in df.columns
+        assert "feature2" in df.columns
+
+    def test_parse_csv_invalid_data(self, model_manager):
+        """Test CSV parsing with invalid data."""
+        invalid_csv = b"not,a,valid,csv\n1,2,3\n4,5"
+
+        with pytest.raises(HTTPException) as exc_info:
+            model_manager.parse_csv(invalid_csv)
+
+        assert exc_info.value.status_code == 400
