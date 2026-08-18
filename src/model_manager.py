@@ -503,3 +503,4 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on shutdown."""
     logger.info("Shutting down Regression API Service")
+# Phase 1: Core Model Training and Serialization - iteration 3
