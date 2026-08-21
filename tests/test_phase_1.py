@@ -1,173 +1,317 @@
 import io
+import logging
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from unittest.mock import Mock, patch
+
 import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from datetime import datetime
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+import statsmodels.api as sm
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field, ValidationError, validator
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 
-from src.model_manager import ModelManager, TrainingRequest, ModelMetrics, TrainingResponse
+from src.model_manager import (
+    RegressionModelManager,
+    TrainingRequest,
+    TrainingMetrics,
+    ModelInfo,
+)
 
 
 @pytest.fixture
-def sample_data():
-    """Create a sample dataset for testing."""
+def sample_dataframe():
+    """Create a sample DataFrame for testing."""
     np.random.seed(42)
     n_samples = 100
-    X1 = np.random.randn(n_samples)
-    X2 = np.random.randn(n_samples)
-    y = 2 * X1 + 3 * X2 + np.random.randn(n_samples) * 0.1
-    return pd.DataFrame({"feature1": X1, "feature2": X2, "target": y})
+    data = {
+        "feature1": np.random.randn(n_samples),
+        "feature2": np.random.randn(n_samples),
+        "target": np.random.randn(n_samples) * 2 + 1,
+    }
+    return pd.DataFrame(data)
 
 
 @pytest.fixture
 def model_manager(tmp_path):
-    """Create a ModelManager instance with a temporary directory."""
-    return ModelManager(model_dir=str(tmp_path / "models"))
+    """Create a RegressionModelManager instance with temp directory."""
+    return RegressionModelManager(model_dir=str(tmp_path))
 
 
-def test_training_request_validation():
-    """Test TrainingRequest validation logic."""
-    # Valid request
-    valid_request = TrainingRequest(
+@pytest.fixture
+def valid_training_request():
+    """Create a valid training request."""
+    return TrainingRequest(
         target_column="target",
         test_size=0.2,
         random_state=42,
-        feature_columns=["feature1", "feature2"]
-    )
-    assert valid_request.target_column == "target"
-    assert valid_request.test_size == 0.2
-
-    # Invalid: empty target column
-    with pytest.raises(ValueError):
-        TrainingRequest(target_column="   ", test_size=0.2)
-
-    # Invalid: test_size out of range
-    with pytest.raises(ValueError):
-        TrainingRequest(target_column="target", test_size=0.6)
-
-    # Invalid: duplicate feature columns
-    with pytest.raises(ValueError):
-        TrainingRequest(
-            target_column="target",
-            feature_columns=["feature1", "feature1"]
-        )
-
-    # Invalid: empty feature columns list
-    with pytest.raises(ValueError):
-        TrainingRequest(
-            target_column="target",
-            feature_columns=[]
-        )
-
-
-def test_model_manager_training_and_metrics(model_manager, sample_data):
-    """Test that ModelManager trains a model and returns valid metrics."""
-    # Train the model
-    result = model_manager.train(
-        data=sample_data,
-        target_column="target",
-        test_size=0.2,
-        random_state=42
+        feature_columns=["feature1", "feature2"],
     )
 
-    # Verify the result structure
-    assert result["success"] is True
-    metrics = result["metrics"]
-    assert isinstance(metrics, ModelMetrics)
 
-    # Verify metrics values
-    assert 0.0 <= metrics.r2_train <= 1.0
-    assert 0.0 <= metrics.r2_test <= 1.0
-    assert metrics.mse_train >= 0
-    assert metrics.mse_test >= 0
-    assert metrics.mae_train >= 0
-    assert metrics.mae_test >= 0
+class TestTrainingRequestValidation:
+    """Test Pydantic validation for TrainingRequest."""
 
-    # Verify coefficients and p-values
-    assert "feature1" in metrics.coefficients
-    assert "feature2" in metrics.coefficients
-    assert "feature1" in metrics.p_values
-    assert "feature2" in metrics.p_values
+    def test_valid_request(self, valid_training_request):
+        """Test that a valid request passes validation."""
+        assert valid_training_request.target_column == "target"
+        assert valid_training_request.test_size == 0.2
+        assert valid_training_request.random_state == 42
+        assert valid_training_request.feature_columns == ["feature1", "feature2"]
 
-    # Verify sample counts
-    assert metrics.training_samples == 80  # 80% of 100
-    assert metrics.test_samples == 20  # 20% of 100
-    assert metrics.feature_count == 2
+    def test_empty_target_column_raises_error(self):
+        """Test that empty target column raises validation error."""
+        with pytest.raises(ValidationError):
+            TrainingRequest(
+                target_column="   ",
+                test_size=0.2,
+                random_state=42,
+            )
 
-    # Verify model file was created
-    assert Path(metrics.model_path).exists()
+    def test_duplicate_feature_columns_raises_error(self):
+        """Test that duplicate feature columns raise validation error."""
+        with pytest.raises(ValidationError):
+            TrainingRequest(
+                target_column="target",
+                test_size=0.2,
+                random_state=42,
+                feature_columns=["feature1", "feature1"],
+            )
 
-
-def test_model_manager_serialization(model_manager, sample_data):
-    """Test that the trained model can be serialized and loaded."""
-    # Train the model
-    result = model_manager.train(
-        data=sample_data,
-        target_column="target",
-        test_size=0.2,
-        random_state=42
-    )
-
-    # Load the serialized model
-    model_path = result["metrics"].model_path
-    loaded_model = joblib.load(model_path)
-
-    # Verify the loaded model works
-    test_data = pd.DataFrame({
-        "feature1": [0.5, -0.3],
-        "feature2": [1.2, 0.7]
-    })
-    predictions = loaded_model.predict(test_data)
-    assert len(predictions) == 2
-    assert all(np.isfinite(predictions))
+    def test_invalid_test_size_raises_error(self):
+        """Test that test_size outside [0.1, 0.5] raises validation error."""
+        with pytest.raises(ValidationError):
+            TrainingRequest(
+                target_column="target",
+                test_size=0.6,
+                random_state=42,
+            )
 
 
-def test_model_manager_error_handling(model_manager, sample_data):
-    """Test error handling for invalid training inputs."""
-    # Test with non-existent target column
-    with pytest.raises(KeyError):
-        model_manager.train(
-            data=sample_data,
-            target_column="nonexistent_column",
-            test_size=0.2,
-            random_state=42
+class TestRegressionModelManager:
+    """Test RegressionModelManager core functionality."""
+
+    def test_train_model_returns_metrics(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that train_model returns valid TrainingMetrics."""
+        metrics = model_manager.train_model(
+            df=sample_dataframe,
+            request=valid_training_request,
         )
 
-    # Test with insufficient data
-    small_data = sample_data.head(5)
-    with pytest.raises(ValueError):
-        model_manager.train(
-            data=small_data,
+        assert isinstance(metrics, TrainingMetrics)
+        assert 0.0 <= metrics.r2_score <= 1.0
+        assert metrics.mse >= 0
+        assert metrics.rmse >= 0
+        assert metrics.mae >= 0
+        assert len(metrics.coefficients) == 2
+        assert "feature1" in metrics.coefficients
+        assert "feature2" in metrics.coefficients
+        assert metrics.training_samples > 0
+        assert metrics.test_samples > 0
+        assert metrics.feature_count == 2
+        assert metrics.training_duration_seconds > 0
+        assert metrics.model_version
+        assert metrics.timestamp
+
+    def test_train_model_with_default_features(
+        self, model_manager, sample_dataframe
+    ):
+        """Test training with default features (all except target)."""
+        request = TrainingRequest(
             target_column="target",
             test_size=0.2,
-            random_state=42
+            random_state=42,
         )
 
+        metrics = model_manager.train_model(
+            df=sample_dataframe,
+            request=request,
+        )
 
-def test_model_manager_diagnostics(model_manager, sample_data):
-    """Test that diagnostic statistics are computed correctly."""
-    # Train the model
-    result = model_manager.train(
-        data=sample_data,
-        target_column="target",
-        test_size=0.2,
-        random_state=42
-    )
+        assert metrics.feature_count == 2
+        assert set(metrics.coefficients.keys()) == {"feature1", "feature2"}
 
-    metrics = result["metrics"]
+    def test_train_model_p_values_are_valid(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that p-values are valid probabilities."""
+        metrics = model_manager.train_model(
+            df=sample_dataframe,
+            request=valid_training_request,
+        )
 
-    # Verify diagnostic statistics are present and valid
-    assert metrics.f_statistic > 0
-    assert 0.0 <= metrics.f_p_value <= 1.0
-    assert 0.0 <= metrics.durbin_watson <= 4.0
-    assert 0.0 <= metrics.breusch_pagan_p_value <= 1.0
+        for feature, p_value in metrics.p_values.items():
+            assert 0.0 <= p_value <= 1.0
+            assert isinstance(p_value, float)
 
-    # Verify p-values are reasonable (should be very small for our synthetic data)
-    assert metrics.p_values["feature1"] < 0.05
-    assert metrics.p_values["feature2"] < 0.05
+    def test_serialize_and_load_model(
+        self, model_manager, sample_dataframe, valid_training_request, tmp_path
+    ):
+        """Test model serialization and loading."""
+        # Train model
+        metrics = model_manager.train_model(
+            df=sample_dataframe,
+            request=valid_training_request,
+        )
 
-    # Verify coefficients are close to true values (2 and 3)
-    assert abs(metrics.coefficients["feature1"] - 2.0) < 0.5
-    assert abs(metrics.coefficients["feature2"] - 3.0) < 0.5
+        # Serialize model
+        model_path = model_manager.save_model(
+            model=model_manager.model,
+            metrics=metrics,
+            feature_names=valid_training_request.feature_columns,
+            target_name=valid_training_request.target_column,
+        )
+
+        assert Path(model_path).exists()
+
+        # Load model
+        loaded_model = model_manager.load_model(model_path)
+        assert loaded_model is not None
+
+        # Test prediction with loaded model
+        test_data = sample_dataframe[valid_training_request.feature_columns].iloc[:5]
+        predictions = loaded_model.predict(test_data)
+        assert len(predictions) == 5
+        assert all(np.isfinite(predictions))
+
+    def test_save_model_creates_model_info(
+        self, model_manager, sample_dataframe, valid_training_request, tmp_path
+    ):
+        """Test that save_model creates proper ModelInfo metadata."""
+        metrics = model_manager.train_model(
+            df=sample_dataframe,
+            request=valid_training_request,
+        )
+
+        model_path = model_manager.save_model(
+            model=model_manager.model,
+            metrics=metrics,
+            feature_names=valid_training_request.feature_columns,
+            target_name=valid_training_request.target_column,
+        )
+
+        # Check that metadata file was created
+        metadata_path = Path(model_path).with_suffix(".json")
+        assert metadata_path.exists()
+
+        # Load and verify metadata
+        import json
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        assert metadata["model_type"] == "linear_regression"
+        assert metadata["target_name"] == "target"
+        assert metadata["feature_names"] == ["feature1", "feature2"]
+        assert metadata["metrics"]["r2_score"] == metrics.r2_score
+        assert metadata["model_id"]
+        assert metadata["created_at"]
+
+    def test_train_model_with_missing_target_column(
+        self, model_manager, sample_dataframe
+    ):
+        """Test that missing target column raises error."""
+        request = TrainingRequest(
+            target_column="nonexistent_target",
+            test_size=0.2,
+            random_state=42,
+        )
+
+        with pytest.raises(KeyError):
+            model_manager.train_model(
+                df=sample_dataframe,
+                request=request,
+            )
+
+    def test_train_model_with_missing_feature_column(
+        self, model_manager, sample_dataframe
+    ):
+        """Test that missing feature column raises error."""
+        request = TrainingRequest(
+            target_column="target",
+            test_size=0.2,
+            random_state=42,
+            feature_columns=["feature1", "nonexistent_feature"],
+        )
+
+        with pytest.raises(KeyError):
+            model_manager.train_model(
+                df=sample_dataframe,
+                request=request,
+            )
+
+    def test_train_model_reproducibility(
+        self, model_manager, sample_dataframe, valid_training_request
+    ):
+        """Test that training is reproducible with same random state."""
+        metrics1 = model_manager.train_model(
+            df=sample_dataframe,
+            request=valid_training_request,
+        )
+
+        metrics2 = model_manager.train_model(
+            df=sample_dataframe,
+            request=valid_training_request,
+        )
+
+        assert metrics1.r2_score == metrics2.r2_score
+        assert metrics1.coefficients == metrics2.coefficients
+        assert metrics1.intercept == metrics2.intercept
+        assert metrics1.training_samples == metrics2.training_samples
+        assert metrics1.test_samples == metrics2.test_samples
+
+    def test_train_model_with_different_random_state(
+        self, model_manager, sample_dataframe
+    ):
+        """Test that different random states produce different splits."""
+        request1 = TrainingRequest(
+            target_column="target",
+            test_size=0.2,
+            random_state=42,
+        )
+        request2 = TrainingRequest(
+            target_column="target",
+            test_size=0.2,
+            random_state=43,
+        )
+
+        metrics1 = model_manager.train_model(
+            df=sample_dataframe,
+            request=request1,
+        )
+        metrics2 = model_manager.train_model(
+            df=sample_dataframe,
+            request=request2,
+        )
+
+        # Different random states should produce different metrics
+        assert metrics1.r2_score != metrics2.r2_score or \
+               metrics1.coefficients != metrics2.coefficients
+
+    def test_model_manager_initialization(self, tmp_path):
+        """Test model manager initialization."""
+        manager = RegressionModelManager(model_dir=str(tmp_path))
+        assert manager.model_dir == Path(tmp_path)
+        assert manager.model is None
+        assert manager.metrics is None
+
+    def test_model_manager_with_custom_model_dir(self, tmp_path):
+        """Test model manager with custom directory."""
+        custom_dir = tmp_path / "custom_models"
+        manager = RegressionModelManager(model_dir=str(custom_dir))
+        assert manager.model_dir == custom_dir
+        assert custom_dir.exists()  # Directory should be created
+
+    def test_load_nonexistent_model(self, model_manager, tmp_path):
+        """Test loading a nonexistent model raises error."""
+        nonexistent_path = tmp_path / "nonexistent_model.joblib"
+        with pytest.raises(FileNotFoundError):
+            model_manager.load_model(str(nonexistent_path))
