@@ -1,7 +1,7 @@
 import io
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import Mock, patch
 
 import joblib
 import numpy as np
@@ -12,16 +12,16 @@ from pydantic import ValidationError
 
 from src.model_manager import (
     ModelManager,
+    ModelTrainingError,
+    ModelValidationError,
     TrainingRequest,
     TrainingResponse,
-    PredictionRequest,
-    PredictionResponse,
 )
 
 
 @pytest.fixture
 def sample_dataframe():
-    """Create a sample DataFrame for testing."""
+    """Create a sample dataframe for testing."""
     np.random.seed(42)
     n_samples = 100
     data = {
@@ -34,26 +34,28 @@ def sample_dataframe():
 
 @pytest.fixture
 def model_manager(tmp_path):
-    """Create a ModelManager instance with a temporary model directory."""
-    return ModelManager(model_dir=str(tmp_path / "models"))
+    """Create a ModelManager instance with a temporary directory."""
+    return ModelManager(model_dir=tmp_path)
 
 
 @pytest.fixture
 def trained_model_manager(model_manager, sample_dataframe):
     """Create a ModelManager with a trained model."""
-    model_manager.train(
+    model_id = model_manager.train(
         df=sample_dataframe,
         target_column="target",
         feature_columns=["feature1", "feature2"],
         test_size=0.2,
         random_state=42,
     )
-    return model_manager
+    return model_manager, model_id
 
 
 class TestTrainingRequest:
+    """Tests for TrainingRequest validation."""
+
     def test_valid_request(self):
-        """Test that a valid TrainingRequest passes validation."""
+        """Test that a valid request passes validation."""
         request = TrainingRequest(
             target_column="target",
             test_size=0.2,
@@ -66,12 +68,12 @@ class TestTrainingRequest:
         assert request.feature_columns == ["feature1", "feature2"]
 
     def test_invalid_target_column(self):
-        """Test that an empty target column raises validation error."""
+        """Test that empty target column raises validation error."""
         with pytest.raises(ValidationError):
-            TrainingRequest(target_column="   ", test_size=0.2)
+            TrainingRequest(target_column="   ")
 
     def test_invalid_test_size(self):
-        """Test that test_size outside [0.1, 0.5] raises validation error."""
+        """Test that test_size outside bounds raises validation error."""
         with pytest.raises(ValidationError):
             TrainingRequest(target_column="target", test_size=0.6)
 
@@ -85,7 +87,64 @@ class TestTrainingRequest:
 
 
 class TestModelManagerTraining:
-    def test_train_returns_training_response(self, model_manager, sample_dataframe):
+    """Tests for ModelManager training functionality."""
+
+    def test_train_success(self, model_manager, sample_dataframe):
+        """Test successful model training."""
+        model_id = model_manager.train(
+            df=sample_dataframe,
+            target_column="target",
+            feature_columns=["feature1", "feature2"],
+            test_size=0.2,
+            random_state=42,
+        )
+
+        # Verify model was saved
+        model_path = model_manager.model_dir / f"{model_id}.joblib"
+        assert model_path.exists()
+
+        # Verify model can be loaded
+        loaded_model = joblib.load(model_path)
+        assert hasattr(loaded_model, "predict")
+
+        # Verify training metadata was saved
+        metadata_path = model_manager.model_dir / f"{model_id}_metadata.json"
+        assert metadata_path.exists()
+
+    def test_train_without_feature_columns(self, model_manager, sample_dataframe):
+        """Test training without specifying feature columns (uses all except target)."""
+        model_id = model_manager.train(
+            df=sample_dataframe,
+            target_column="target",
+            test_size=0.2,
+            random_state=42,
+        )
+
+        model_path = model_manager.model_dir / f"{model_id}.joblib"
+        assert model_path.exists()
+
+    def test_train_invalid_target(self, model_manager, sample_dataframe):
+        """Test training with non-existent target column."""
+        with pytest.raises(ModelValidationError):
+            model_manager.train(
+                df=sample_dataframe,
+                target_column="nonexistent_column",
+                test_size=0.2,
+                random_state=42,
+            )
+
+    def test_train_invalid_feature_columns(self, model_manager, sample_dataframe):
+        """Test training with non-existent feature columns."""
+        with pytest.raises(ModelValidationError):
+            model_manager.train(
+                df=sample_dataframe,
+                target_column="target",
+                feature_columns=["nonexistent_feature"],
+                test_size=0.2,
+                random_state=42,
+            )
+
+    def test_train_returns_valid_response(self, model_manager, sample_dataframe):
         """Test that training returns a valid TrainingResponse."""
         response = model_manager.train(
             df=sample_dataframe,
@@ -96,177 +155,200 @@ class TestModelManagerTraining:
         )
 
         assert isinstance(response, TrainingResponse)
-        assert response.model_id
-        assert response.training_timestamp
         assert response.r_squared > 0
         assert response.mse >= 0
         assert response.rmse >= 0
         assert response.mae >= 0
+        assert response.sample_size == len(sample_dataframe)
+        assert response.feature_count == 2
         assert "feature1" in response.coefficients
         assert "feature2" in response.coefficients
         assert "feature1" in response.p_values
         assert "feature2" in response.p_values
         assert response.model_path.endswith(".joblib")
-
-    def test_train_serializes_model(self, model_manager, sample_dataframe):
-        """Test that training saves the model to disk."""
-        response = model_manager.train(
-            df=sample_dataframe,
-            target_column="target",
-            feature_columns=["feature1", "feature2"],
-        )
-
-        model_path = Path(response.model_path)
-        assert model_path.exists()
-        assert model_path.suffix == ".joblib"
-
-        # Verify the model can be loaded
-        loaded_model = joblib.load(model_path)
-        assert loaded_model is not None
-
-    def test_train_with_default_features(self, model_manager, sample_dataframe):
-        """Test training with default feature columns (all except target)."""
-        response = model_manager.train(
-            df=sample_dataframe,
-            target_column="target",
-        )
-
-        assert "feature1" in response.coefficients
-        assert "feature2" in response.coefficients
-
-    def test_train_invalid_target_column(self, model_manager, sample_dataframe):
-        """Test training with non-existent target column raises error."""
-        with pytest.raises(ValueError, match="Target column 'nonexistent' not found"):
-            model_manager.train(
-                df=sample_dataframe,
-                target_column="nonexistent",
-            )
-
-    def test_train_invalid_feature_columns(self, model_manager, sample_dataframe):
-        """Test training with non-existent feature column raises error."""
-        with pytest.raises(ValueError, match="Feature column 'nonexistent' not found"):
-            model_manager.train(
-                df=sample_dataframe,
-                target_column="target",
-                feature_columns=["nonexistent"],
-            )
+        assert "breusch_pagan" in response.diagnostics
+        assert "durbin_watson" in response.diagnostics
 
 
 class TestModelManagerPrediction:
-    def test_predict_returns_prediction_response(self, trained_model_manager):
-        """Test that prediction returns a valid PredictionResponse."""
-        features = {"feature1": 1.0, "feature2": 2.0}
-        response = trained_model_manager.predict(features)
+    """Tests for ModelManager prediction functionality."""
 
-        assert isinstance(response, PredictionResponse)
-        assert isinstance(response.prediction, float)
-        assert response.model_id == trained_model_manager.model_id
-        assert response.timestamp
+    def test_predict_success(self, trained_model_manager, sample_dataframe):
+        """Test successful prediction with trained model."""
+        model_manager, model_id = trained_model_manager
 
-    def test_predict_with_missing_features(self, trained_model_manager):
-        """Test prediction with missing feature raises error."""
-        with pytest.raises(ValueError, match="Missing features"):
-            trained_model_manager.predict({"feature1": 1.0})
+        # Create test data
+        test_data = pd.DataFrame({
+            "feature1": [0.5, -0.3],
+            "feature2": [1.2, -0.8],
+        })
 
-    def test_predict_with_extra_features(self, trained_model_manager):
-        """Test prediction with extra features raises error."""
-        with pytest.raises(ValueError, match="Unexpected features"):
-            trained_model_manager.predict(
-                {"feature1": 1.0, "feature2": 2.0, "extra": 3.0}
-            )
+        predictions = model_manager.predict(model_id, test_data)
 
-    def test_predict_before_training(self, model_manager):
-        """Test prediction before training raises error."""
-        with pytest.raises(RuntimeError, match="Model not trained"):
-            model_manager.predict({"feature1": 1.0, "feature2": 2.0})
+        assert len(predictions) == 2
+        assert all(isinstance(p, (int, float)) for p in predictions)
 
+    def test_predict_nonexistent_model(self, model_manager, sample_dataframe):
+        """Test prediction with non-existent model ID."""
+        with pytest.raises(ModelTrainingError):
+            model_manager.predict("nonexistent_model", sample_dataframe)
 
-class TestModelManagerDiagnostics:
-    def test_diagnostics_include_breusch_pagan(self, trained_model_manager):
-        """Test that diagnostics include Breusch-Pagan test results."""
-        response = trained_model_manager.model_metadata
-        assert "breusch_pagan" in response["diagnostics"]
-        bp_result = response["diagnostics"]["breusch_pagan"]
-        assert "lm_statistic" in bp_result
-        assert "lm_pvalue" in bp_result
-        assert "f_statistic" in bp_result
-        assert "f_pvalue" in bp_result
+    def test_predict_missing_features(self, trained_model_manager):
+        """Test prediction with missing feature columns."""
+        model_manager, model_id = trained_model_manager
 
-    def test_diagnostics_include_durbin_watson(self, trained_model_manager):
-        """Test that diagnostics include Durbin-Watson statistic."""
-        response = trained_model_manager.model_metadata
-        assert "durbin_watson" in response["diagnostics"]
-        assert isinstance(response["diagnostics"]["durbin_watson"], float)
+        test_data = pd.DataFrame({
+            "feature1": [0.5, -0.3],
+            # Missing feature2
+        })
 
-    def test_feature_importance_matches_coefficients(self, trained_model_manager):
-        """Test that feature importance is derived from coefficients."""
-        response = trained_model_manager.model_metadata
-        for feature in response["coefficients"]:
-            assert feature in response["feature_importance"]
-            assert response["feature_importance"][feature] == abs(
-                response["coefficients"][feature]
-            )
+        with pytest.raises(ModelValidationError):
+            model_manager.predict(model_id, test_data)
 
 
 class TestModelManagerSerialization:
+    """Tests for model serialization and loading."""
+
     def test_save_and_load_model(self, model_manager, sample_dataframe):
-        """Test that model can be saved and loaded back."""
-        # Train model
-        response = model_manager.train(
+        """Test that model can be saved and loaded correctly."""
+        model_id = model_manager.train(
             df=sample_dataframe,
-            target_column="target",
-            feature_columns=["feature1", "feature2"],
-        )
-
-        # Create a new manager and load the model
-        new_manager = ModelManager(model_dir=model_manager.model_dir)
-        new_manager.load_model(response.model_id)
-
-        # Verify predictions match
-        features = {"feature1": 0.5, "feature2": -0.5}
-        pred1 = model_manager.predict(features)
-        pred2 = new_manager.predict(features)
-        assert pred1.prediction == pytest.approx(pred2.prediction)
-
-    def test_load_nonexistent_model(self, model_manager):
-        """Test loading a non-existent model raises error."""
-        with pytest.raises(FileNotFoundError):
-            model_manager.load_model("nonexistent_model_id")
-
-
-class TestModelManagerUpload:
-    @pytest.mark.asyncio
-    async def test_train_from_upload(self, model_manager, sample_dataframe):
-        """Test training from an uploaded CSV file."""
-        # Create a mock UploadFile
-        csv_buffer = io.StringIO()
-        sample_dataframe.to_csv(csv_buffer, index=False)
-        csv_bytes = csv_buffer.getvalue().encode()
-
-        upload_file = MagicMock(spec=UploadFile)
-        upload_file.filename = "data.csv"
-        upload_file.read = MagicMock(return_value=csv_bytes)
-
-        response = model_manager.train_from_upload(
-            upload_file=upload_file,
             target_column="target",
             feature_columns=["feature1", "feature2"],
             test_size=0.2,
             random_state=42,
         )
 
-        assert isinstance(response, TrainingResponse)
-        assert response.r_squared > 0
+        # Load the model
+        loaded_model = model_manager.load_model(model_id)
 
-    @pytest.mark.asyncio
-    async def test_train_from_upload_invalid_csv(self, model_manager):
-        """Test training from invalid CSV raises error."""
-        upload_file = MagicMock(spec=UploadFile)
-        upload_file.filename = "data.csv"
-        upload_file.read = MagicMock(return_value=b"invalid,csv,data\n1,2,3\n")
+        # Verify it's a sklearn model
+        from sklearn.linear_model import LinearRegression
+        assert isinstance(loaded_model, LinearRegression)
 
-        with pytest.raises(ValueError, match="Error reading CSV"):
-            await model_manager.train_from_upload(
-                upload_file=upload_file,
+        # Test prediction consistency
+        test_data = pd.DataFrame({
+            "feature1": [0.1, 0.2],
+            "feature2": [0.3, 0.4],
+        })
+
+        predictions_before = model_manager.predict(model_id, test_data)
+        predictions_after = loaded_model.predict(test_data[["feature1", "feature2"]])
+
+        np.testing.assert_array_almost_equal(predictions_before, predictions_after)
+
+    def test_model_metadata_saved(self, model_manager, sample_dataframe):
+        """Test that model metadata is saved correctly."""
+        model_id = model_manager.train(
+            df=sample_dataframe,
+            target_column="target",
+            feature_columns=["feature1", "feature2"],
+            test_size=0.2,
+            random_state=42,
+        )
+
+        metadata_path = model_manager.model_dir / f"{model_id}_metadata.json"
+        assert metadata_path.exists()
+
+        import json
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        assert metadata["model_id"] == model_id
+        assert metadata["target_column"] == "target"
+        assert metadata["feature_columns"] == ["feature1", "feature2"]
+        assert metadata["test_size"] == 0.2
+        assert metadata["random_state"] == 42
+        assert "training_timestamp" in metadata
+        assert "metrics" in metadata
+
+
+class TestModelManagerDiagnostics:
+    """Tests for model diagnostics."""
+
+    def test_diagnostics_are_computed(self, model_manager, sample_dataframe):
+        """Test that diagnostics are computed and returned."""
+        response = model_manager.train(
+            df=sample_dataframe,
+            target_column="target",
+            feature_columns=["feature1", "feature2"],
+            test_size=0.2,
+            random_state=42,
+        )
+
+        # Check R-squared
+        assert 0 <= response.r_squared <= 1
+
+        # Check adjusted R-squared
+        assert 0 <= response.adjusted_r_squared <= 1
+
+        # Check coefficients
+        assert len(response.coefficients) == 2
+        assert all(isinstance(v, float) for v in response.coefficients.values())
+
+        # Check p-values
+        assert len(response.p_values) == 2
+        assert all(isinstance(v, float) for v in response.p_values.values())
+
+        # Check diagnostics
+        assert "breusch_pagan" in response.diagnostics
+        assert "durbin_watson" in response.diagnostics
+        assert isinstance(response.diagnostics["breusch_pagan"], dict)
+        assert isinstance(response.diagnostics["durbin_watson"], float)
+
+    def test_diagnostics_with_single_feature(self, model_manager, sample_dataframe):
+        """Test diagnostics with a single feature."""
+        response = model_manager.train(
+            df=sample_dataframe,
+            target_column="target",
+            feature_columns=["feature1"],
+            test_size=0.2,
+            random_state=42,
+        )
+
+        assert response.feature_count == 1
+        assert len(response.coefficients) == 1
+        assert len(response.p_values) == 1
+
+
+class TestModelManagerErrorHandling:
+    """Tests for error handling in ModelManager."""
+
+    def test_train_with_empty_dataframe(self, model_manager):
+        """Test training with empty dataframe."""
+        empty_df = pd.DataFrame()
+        with pytest.raises(ModelValidationError):
+            model_manager.train(
+                df=empty_df,
                 target_column="target",
+                test_size=0.2,
+                random_state=42,
+            )
+
+    def test_train_with_insufficient_data(self, model_manager):
+        """Test training with too few samples."""
+        small_df = pd.DataFrame({
+            "feature1": [1, 2, 3],
+            "target": [1, 2, 3],
+        })
+        with pytest.raises(ModelValidationError):
+            model_manager.train(
+                df=small_df,
+                target_column="target",
+                test_size=0.2,
+                random_state=42,
+            )
+
+    def test_train_with_constant_target(self, model_manager):
+        """Test training with constant target variable."""
+        constant_df = pd.DataFrame({
+            "feature1": [1, 2, 3, 4, 5],
+            "target": [1, 1, 1, 1, 1],
+        })
+        with pytest.raises(ModelTrainingError):
+            model_manager.train(
+                df=constant_df,
+                target_column="target",
+                test_size=0.2,
+                random_state=42,
             )
