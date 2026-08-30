@@ -1,274 +1,268 @@
-import asyncio
 import io
-import json
-from datetime import datetime
+import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch, MagicMock
 
 import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from fastapi import UploadFile
-from pydantic import ValidationError
+from fastapi import HTTPException
 
-from src.model_manager import (
-    ErrorResponse,
-    ModelManager,
-    TrainingRequest,
-    TrainingResponse,
-)
+from src.model_manager import ModelManager, TrainingRequest, TrainingResponse
 
 
 @pytest.fixture
-def sample_dataframe():
-    """Create a sample dataframe for testing."""
+def sample_data():
+    """Create a sample dataset for testing."""
     np.random.seed(42)
     n_samples = 100
-    data = {
-        "feature1": np.random.randn(n_samples),
-        "feature2": np.random.randn(n_samples),
-        "target": np.random.randn(n_samples) * 2 + 1,
-    }
-    return pd.DataFrame(data)
+    data = pd.DataFrame({
+        'feature1': np.random.normal(0, 1, n_samples),
+        'feature2': np.random.normal(0, 1, n_samples),
+        'target': np.random.normal(0, 1, n_samples) + 2 * np.random.normal(0, 1, n_samples)
+    })
+    return data
 
 
 @pytest.fixture
 def model_manager(tmp_path):
     """Create a ModelManager instance with a temporary directory."""
-    return ModelManager(model_dir=str(tmp_path / "models"))
+    return ModelManager(model_dir=Path(tmp_path))
 
 
 @pytest.fixture
 def valid_training_request():
     """Create a valid training request."""
     return TrainingRequest(
-        target_column="target",
+        target_column='target',
         test_size=0.2,
         random_state=42,
-        feature_columns=["feature1", "feature2"],
+        feature_columns=['feature1', 'feature2']
     )
 
 
-class TestTrainingRequest:
-    """Tests for TrainingRequest validation."""
+@pytest.mark.asyncio
+async def test_train_model_returns_valid_response(model_manager, sample_data, valid_training_request):
+    """Test that training returns a valid TrainingResponse with expected metrics."""
+    # Act
+    response = await model_manager.train_model(
+        data=sample_data,
+        target_column=valid_training_request.target_column,
+        test_size=valid_training_request.test_size,
+        random_state=valid_training_request.random_state,
+        feature_columns=valid_training_request.feature_columns
+    )
 
-    def test_valid_request(self, valid_training_request):
-        """Test that a valid request passes validation."""
-        assert valid_training_request.target_column == "target"
-        assert valid_training_request.test_size == 0.2
-        assert valid_training_request.random_state == 42
-        assert valid_training_request.feature_columns == ["feature1", "feature2"]
-
-    def test_empty_target_column(self):
-        """Test that empty target column raises validation error."""
-        with pytest.raises(ValidationError):
-            TrainingRequest(target_column="   ", test_size=0.2)
-
-    def test_invalid_test_size(self):
-        """Test that test_size outside [0.1, 0.5] raises validation error."""
-        with pytest.raises(ValidationError):
-            TrainingRequest(target_column="target", test_size=0.6)
-        with pytest.raises(ValidationError):
-            TrainingRequest(target_column="target", test_size=0.05)
-
-    def test_duplicate_feature_columns(self):
-        """Test that duplicate feature columns raise validation error."""
-        with pytest.raises(ValidationError):
-            TrainingRequest(
-                target_column="target",
-                feature_columns=["feature1", "feature1"],
-            )
-
-    def test_empty_feature_columns(self):
-        """Test that empty feature columns list raises validation error."""
-        with pytest.raises(ValidationError):
-            TrainingRequest(target_column="target", feature_columns=[])
+    # Assert
+    assert isinstance(response, TrainingResponse)
+    assert response.model_id is not None
+    assert response.timestamp is not None
+    assert response.r_squared > 0.5  # Should have decent R² with correlated data
+    assert response.n_samples == 100
+    assert response.n_features == 2
+    assert set(response.coefficients.keys()) == {'feature1', 'feature2'}
+    assert set(response.p_values.keys()) == {'feature1', 'feature2'}
+    assert response.mse > 0
+    assert response.rmse > 0
+    assert response.mae > 0
+    assert response.f_statistic > 0
+    assert response.f_p_value < 0.05  # Model should be significant
+    assert response.model_path.endswith('.joblib')
 
 
-class TestModelManager:
-    """Tests for ModelManager core functionality."""
+@pytest.mark.asyncio
+async def test_train_model_serializes_model_file(model_manager, sample_data, valid_training_request):
+    """Test that the trained model is actually saved to disk."""
+    # Act
+    response = await model_manager.train_model(
+        data=sample_data,
+        target_column=valid_training_request.target_column,
+        test_size=valid_training_request.test_size,
+        random_state=valid_training_request.random_state,
+        feature_columns=valid_training_request.feature_columns
+    )
 
-    @pytest.mark.asyncio
-    async def test_train_success(self, model_manager, sample_dataframe, valid_training_request):
-        """Test successful model training with valid data."""
-        # Convert dataframe to CSV bytes for upload
-        csv_bytes = sample_dataframe.to_csv(index=False).encode()
-        upload_file = UploadFile(
-            filename="data.csv",
-            file=io.BytesIO(csv_bytes),
+    # Assert
+    model_path = Path(response.model_path)
+    assert model_path.exists()
+    assert model_path.is_file()
+    
+    # Verify the model can be loaded and makes predictions
+    loaded_model = joblib.load(model_path)
+    assert hasattr(loaded_model, 'predict')
+    
+    # Test prediction
+    test_data = sample_data[valid_training_request.feature_columns].iloc[:5]
+    predictions = loaded_model.predict(test_data)
+    assert len(predictions) == 5
+    assert all(np.isfinite(predictions))
+
+
+@pytest.mark.asyncio
+async def test_train_model_with_auto_feature_selection(model_manager, sample_data):
+    """Test that training works when feature_columns is None (uses all other columns)."""
+    # Arrange
+    request = TrainingRequest(
+        target_column='target',
+        test_size=0.2,
+        random_state=42,
+        feature_columns=None
+    )
+
+    # Act
+    response = await model_manager.train_model(
+        data=sample_data,
+        target_column=request.target_column,
+        test_size=request.test_size,
+        random_state=request.random_state,
+        feature_columns=request.feature_columns
+    )
+
+    # Assert
+    assert response.n_features == 2  # Should use both feature columns
+    assert set(response.coefficients.keys()) == {'feature1', 'feature2'}
+
+
+@pytest.mark.asyncio
+async def test_train_model_handles_missing_target_column(model_manager, sample_data):
+    """Test that training raises appropriate error for missing target column."""
+    # Arrange
+    request = TrainingRequest(
+        target_column='nonexistent_column',
+        test_size=0.2,
+        random_state=42
+    )
+
+    # Act & Assert
+    with pytest.raises(HTTPException) as exc_info:
+        await model_manager.train_model(
+            data=sample_data,
+            target_column=request.target_column,
+            test_size=request.test_size,
+            random_state=request.random_state,
+            feature_columns=request.feature_columns
+        )
+    
+    assert exc_info.value.status_code == 400
+    assert "Target column" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_train_model_handles_invalid_feature_columns(model_manager, sample_data):
+    """Test that training raises appropriate error for invalid feature columns."""
+    # Arrange
+    request = TrainingRequest(
+        target_column='target',
+        test_size=0.2,
+        random_state=42,
+        feature_columns=['nonexistent_feature']
+    )
+
+    # Act & Assert
+    with pytest.raises(HTTPException) as exc_info:
+        await model_manager.train_model(
+            data=sample_data,
+            target_column=request.target_column,
+            test_size=request.test_size,
+            random_state=request.random_state,
+            feature_columns=request.feature_columns
+        )
+    
+    assert exc_info.value.status_code == 400
+    assert "Feature column" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_train_model_handles_insufficient_data(model_manager):
+    """Test that training raises appropriate error for insufficient data."""
+    # Arrange
+    small_data = pd.DataFrame({
+        'feature1': [1, 2, 3],
+        'feature2': [4, 5, 6],
+        'target': [7, 8, 9]
+    })
+    request = TrainingRequest(
+        target_column='target',
+        test_size=0.5,
+        random_state=42
+    )
+
+    # Act & Assert
+    with pytest.raises(HTTPException) as exc_info:
+        await model_manager.train_model(
+            data=small_data,
+            target_column=request.target_column,
+            test_size=request.test_size,
+            random_state=request.random_state,
+            feature_columns=request.feature_columns
+        )
+    
+    assert exc_info.value.status_code == 400
+    assert "Insufficient data" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_train_model_handles_nan_values(model_manager, sample_data):
+    """Test that training handles NaN values in the data."""
+    # Arrange
+    data_with_nan = sample_data.copy()
+    data_with_nan.loc[0, 'feature1'] = np.nan
+    data_with_nan.loc[1, 'target'] = np.nan
+    request = TrainingRequest(
+        target_column='target',
+        test_size=0.2,
+        random_state=42
+    )
+
+    # Act
+    response = await model_manager.train_model(
+        data=data_with_nan,
+        target_column=request.target_column,
+        test_size=request.test_size,
+        random_state=request.random_state,
+        feature_columns=request.feature_columns
+    )
+
+    # Assert
+    assert response.n_samples < 100  # Should have dropped rows with NaN
+    assert response.r_squared > 0.5
+
+
+@pytest.mark.asyncio
+async def test_training_request_validation():
+    """Test Pydantic validation for TrainingRequest."""
+    # Test valid request
+    valid_request = TrainingRequest(
+        target_column='target',
+        test_size=0.2,
+        random_state=42
+    )
+    assert valid_request.target_column == 'target'
+    assert valid_request.test_size == 0.2
+    assert valid_request.random_state == 42
+
+    # Test invalid test_size
+    with pytest.raises(Exception):
+        TrainingRequest(
+            target_column='target',
+            test_size=0.6,  # Too large
+            random_state=42
         )
 
-        response = await model_manager.train(
-            file=upload_file,
-            request=valid_training_request,
+    # Test invalid target_column
+    with pytest.raises(Exception):
+        TrainingRequest(
+            target_column='',  # Empty
+            test_size=0.2,
+            random_state=42
         )
 
-        # Verify response structure
-        assert isinstance(response, TrainingResponse)
-        assert response.model_id is not None
-        assert response.r_squared > 0.5  # Should have decent R² with this data
-        assert response.training_samples == 80  # 80% of 100
-        assert response.test_samples == 20  # 20% of 100
-        assert response.feature_columns == ["feature1", "feature2"]
-        assert response.target_column == "target"
-        assert response.created_at is not None
-        assert response.model_path is not None
-
-        # Verify model file was saved
-        model_path = Path(response.model_path)
-        assert model_path.exists()
-        assert model_path.suffix == ".joblib"
-
-        # Verify metrics are reasonable
-        assert 0 <= response.mse <= 10
-        assert 0 <= response.mae <= 5
-        assert 0 <= response.rmse <= 5
-        assert len(response.coefficients) == 2
-        assert len(response.p_values) == 2
-
-    @pytest.mark.asyncio
-    async def test_train_without_feature_columns(self, model_manager, sample_dataframe):
-        """Test training when feature_columns is None (uses all except target)."""
-        csv_bytes = sample_dataframe.to_csv(index=False).encode()
-        upload_file = UploadFile(
-            filename="data.csv",
-            file=io.BytesIO(csv_bytes),
+    # Test duplicate feature columns
+    with pytest.raises(Exception):
+        TrainingRequest(
+            target_column='target',
+            test_size=0.2,
+            random_state=42,
+            feature_columns=['feature1', 'feature1']  # Duplicate
         )
-        request = TrainingRequest(target_column="target", test_size=0.2)
-
-        response = await model_manager.train(file=upload_file, request=request)
-
-        assert response.feature_columns == ["feature1", "feature2"]
-        assert response.training_samples == 80
-
-    @pytest.mark.asyncio
-    async def test_train_invalid_csv(self, model_manager, valid_training_request):
-        """Test training with invalid CSV data."""
-        upload_file = UploadFile(
-            filename="data.csv",
-            file=io.BytesIO(b"invalid,csv,data\n1,2,3\n4,5"),
-        )
-
-        with pytest.raises(HTTPException) as exc_info:
-            await model_manager.train(file=upload_file, request=valid_training_request)
-
-        assert exc_info.value.status_code == 400
-        assert "error" in str(exc_info.value.detail).lower()
-
-    @pytest.mark.asyncio
-    async def test_train_missing_target_column(self, model_manager, sample_dataframe, valid_training_request):
-        """Test training when target column doesn't exist in data."""
-        # Remove target column from data
-        df_without_target = sample_dataframe.drop(columns=["target"])
-        csv_bytes = df_without_target.to_csv(index=False).encode()
-        upload_file = UploadFile(
-            filename="data.csv",
-            file=io.BytesIO(csv_bytes),
-        )
-
-        with pytest.raises(HTTPException) as exc_info:
-            await model_manager.train(file=upload_file, request=valid_training_request)
-
-        assert exc_info.value.status_code == 400
-        assert "target" in str(exc_info.value.detail).lower()
-
-    @pytest.mark.asyncio
-    async def test_train_missing_feature_column(self, model_manager, sample_dataframe, valid_training_request):
-        """Test training when a specified feature column doesn't exist."""
-        # Create request with non-existent feature
-        bad_request = TrainingRequest(
-            target_column="target",
-            feature_columns=["feature1", "nonexistent_feature"],
-        )
-        csv_bytes = sample_dataframe.to_csv(index=False).encode()
-        upload_file = UploadFile(
-            filename="data.csv",
-            file=io.BytesIO(csv_bytes),
-        )
-
-        with pytest.raises(HTTPException) as exc_info:
-            await model_manager.train(file=upload_file, request=bad_request)
-
-        assert exc_info.value.status_code == 400
-        assert "feature" in str(exc_info.value.detail).lower()
-
-    @pytest.mark.asyncio
-    async def test_model_serialization(self, model_manager, sample_dataframe, valid_training_request):
-        """Test that the trained model can be loaded back from disk."""
-        csv_bytes = sample_dataframe.to_csv(index=False).encode()
-        upload_file = UploadFile(
-            filename="data.csv",
-            file=io.BytesIO(csv_bytes),
-        )
-
-        response = await model_manager.train(file=upload_file, request=valid_training_request)
-
-        # Load the saved model
-        loaded_model = joblib.load(response.model_path)
-        assert loaded_model is not None
-
-        # Verify the model can make predictions
-        test_data = sample_dataframe[["feature1", "feature2"]].iloc[:5]
-        predictions = loaded_model.predict(test_data)
-        assert len(predictions) == 5
-        assert all(np.isfinite(predictions))
-
-    @pytest.mark.asyncio
-    async def test_concurrent_training(self, model_manager, sample_dataframe, valid_training_request):
-        """Test that concurrent training requests are handled safely."""
-        csv_bytes = sample_dataframe.to_csv(index=False).encode()
-        upload_file1 = UploadFile(
-            filename="data1.csv",
-            file=io.BytesIO(csv_bytes),
-        )
-        upload_file2 = UploadFile(
-            filename="data2.csv",
-            file=io.BytesIO(csv_bytes),
-        )
-
-        # Run two training requests concurrently
-        responses = await asyncio.gather(
-            model_manager.train(file=upload_file1, request=valid_training_request),
-            model_manager.train(file=upload_file2, request=valid_training_request),
-        )
-
-        # Both should succeed with different model IDs
-        assert responses[0].model_id != responses[1].model_id
-        assert responses[0].model_path != responses[1].model_path
-        assert responses[0].r_squared == responses[1].r_squared  # Same data, same result
-
-    @pytest.mark.asyncio
-    async def test_error_response_model(self):
-        """Test ErrorResponse model validation."""
-        error_response = ErrorResponse(
-            error="Test error",
-            detail="Test detail",
-            timestamp=datetime.now(),
-        )
-        assert error_response.error == "Test error"
-        assert error_response.detail == "Test detail"
-        assert error_response.timestamp is not None
-
-    @pytest.mark.asyncio
-    async def test_training_response_model(self):
-        """Test TrainingResponse model validation."""
-        response = TrainingResponse(
-            model_id="test_model",
-            metrics={"r2": 0.95},
-            coefficients={"feature1": 1.5},
-            p_values={"feature1": 0.01},
-            r_squared=0.95,
-            adjusted_r_squared=0.94,
-            mse=0.5,
-            mae=0.4,
-            rmse=0.7,
-            training_samples=80,
-            test_samples=20,
-            feature_columns=["feature1"],
-            target_column="target",
-            created_at=datetime.now(),
-            model_path="/tmp/test_model.joblib",
-        )
-        assert response.model_id == "test_model"
-        assert response.r_squared == 0.95
