@@ -401,3 +401,4 @@ async def get_model_info(model_name: str) -> Dict[str, Any]:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+# Phase 1: Core Model Training and Serialization - iteration 3
