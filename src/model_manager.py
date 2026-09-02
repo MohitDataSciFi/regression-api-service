@@ -1,8 +1,7 @@
 import asyncio
 import io
 import logging
-import os
-import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -10,15 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import joblib
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field, ValidationError, validator
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
-from statsmodels.api import OLS, add_constant
-from statsmodels.stats.diagnostic import het_breuschpagan
-from statsmodels.stats.stattools import durbin_watson
 
 # Configure structured logging
 logging.basicConfig(
@@ -29,384 +26,445 @@ logging.basicConfig(
         logging.FileHandler("regression_api.log")
     ]
 )
-logger = logging.getLogger("regression_api")
-
-# Constants
-MODEL_DIR = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-SUPPORTED_EXTENSIONS = {".csv", ".txt"}
+logger = logging.getLogger(__name__)
 
 
+# ==================== Schemas ====================
 class TrainingRequest(BaseModel):
     """Pydantic model for training request validation."""
     target_column: str = Field(..., min_length=1, description="Name of the target column")
     test_size: float = Field(0.2, ge=0.1, le=0.5, description="Test set proportion")
     random_state: int = Field(42, ge=0, description="Random seed for reproducibility")
-    feature_columns: Optional[List[str]] = Field(None, description="List of feature columns. If None, all other columns used")
     
     @validator("target_column")
     def validate_target_column(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("Target column cannot be empty")
         return v.strip()
-    
-    @validator("feature_columns")
-    def validate_feature_columns(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        if v is not None:
-            if len(v) == 0:
-                raise ValueError("Feature columns list cannot be empty")
-            cleaned = [col.strip() for col in v if col.strip()]
-            if len(cleaned) != len(v):
-                raise ValueError("Feature columns cannot contain empty strings")
-            return cleaned
-        return v
 
 
 class TrainingResponse(BaseModel):
     """Response model for training results."""
     model_id: str
-    metrics: Dict[str, Any]
-    diagnostics: Dict[str, Any]
-    feature_importance: Dict[str, float]
-    training_timestamp: str
+    timestamp: str
+    metrics: Dict[str, float]
+    coefficients: Dict[str, float]
+    p_values: Dict[str, float]
+    r_squared: float
+    adjusted_r_squared: float
+    mse: float
+    rmse: float
+    mae: float
+    n_samples: int
+    n_features: int
     model_path: str
 
 
+class PredictionRequest(BaseModel):
+    """Request model for predictions."""
+    features: Dict[str, float] = Field(..., description="Feature values for prediction")
+    
+    @validator("features")
+    def validate_features(cls, v: Dict[str, float]) -> Dict[str, float]:
+        if not v:
+            raise ValueError("Features dictionary cannot be empty")
+        return v
+
+
+class PredictionResponse(BaseModel):
+    """Response model for predictions."""
+    prediction: float
+    model_id: str
+    timestamp: str
+
+
+# ==================== Model Manager ====================
 class ModelManager:
-    """Manages regression model training, diagnostics, and serialization."""
+    """Manages regression model training, serialization, and prediction."""
     
-    def __init__(self, model_dir: Path = MODEL_DIR):
-        self.model_dir = model_dir
-        self.model_dir.mkdir(exist_ok=True)
+    def __init__(self, model_dir: str = "models"):
+        self.model_dir = Path(model_dir)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self._models: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
-        logger.info(f"ModelManager initialized with directory: {self.model_dir}")
+        logger.info(f"ModelManager initialized with model directory: {self.model_dir}")
     
-    async def train_and_save(
+    async def train_model(
         self,
         data: pd.DataFrame,
         target_column: str,
-        test_size: float,
-        random_state: int,
-        feature_columns: Optional[List[str]] = None
+        test_size: float = 0.2,
+        random_state: int = 42
     ) -> Dict[str, Any]:
-        """Train OLS model, compute diagnostics, and save model."""
+        """Train a regression model with full diagnostics."""
+        start_time = time.time()
+        model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{random_state}"
+        
+        try:
+            # Validate data
+            if target_column not in data.columns:
+                raise ValueError(f"Target column '{target_column}' not found in data")
+            
+            if data.empty:
+                raise ValueError("Data is empty")
+            
+            # Separate features and target
+            X = data.drop(columns=[target_column])
+            y = data[target_column]
+            
+            # Handle categorical variables
+            X = pd.get_dummies(X, drop_first=True)
+            
+            # Check for non-numeric columns
+            numeric_cols = X.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) != len(X.columns):
+                raise ValueError("All features must be numeric after encoding")
+            
+            # Check for NaN values
+            if X.isnull().any().any() or y.isnull().any():
+                raise ValueError("Data contains NaN values")
+            
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=random_state
+            )
+            
+            # Train scikit-learn model
+            sklearn_model = LinearRegression()
+            sklearn_model.fit(X_train, y_train)
+            
+            # Train statsmodels for diagnostics
+            X_train_sm = sm.add_constant(X_train)
+            statsmodels_model = sm.OLS(y_train, X_train_sm).fit()
+            
+            # Make predictions
+            y_pred_train = sklearn_model.predict(X_train)
+            y_pred_test = sklearn_model.predict(X_test)
+            
+            # Calculate metrics
+            r_squared = r2_score(y_test, y_pred_test)
+            mse = mean_squared_error(y_test, y_pred_test)
+            rmse = np.sqrt(mse)
+            mae = mean_absolute_error(y_test, y_pred_test)
+            
+            # Extract coefficients and p-values
+            coefficients = {}
+            p_values = {}
+            
+            # Get feature names from sklearn model
+            feature_names = X.columns.tolist()
+            
+            # Map coefficients from statsmodels (which includes constant)
+            sm_params = statsmodels_model.params
+            sm_pvalues = statsmodels_model.pvalues
+            
+            # Handle constant term
+            if "const" in sm_params.index:
+                coefficients["intercept"] = float(sm_params["const"])
+                p_values["intercept"] = float(sm_pvalues["const"])
+            
+            # Map feature coefficients
+            for i, feature in enumerate(feature_names):
+                if feature in sm_params.index:
+                    coefficients[feature] = float(sm_params[feature])
+                    p_values[feature] = float(sm_pvalues[feature])
+                else:
+                    # Fallback to sklearn coefficients
+                    coefficients[feature] = float(sklearn_model.coef_[i])
+                    p_values[feature] = float("nan")
+            
+            # Prepare model bundle
+            model_bundle = {
+                "sklearn_model": sklearn_model,
+                "statsmodels_model": statsmodels_model,
+                "feature_names": feature_names,
+                "target_column": target_column,
+                "model_id": model_id,
+                "training_date": datetime.now().isoformat(),
+                "metrics": {
+                    "r_squared": float(r_squared),
+                    "adjusted_r_squared": float(statsmodels_model.rsquared_adj),
+                    "mse": float(mse),
+                    "rmse": float(rmse),
+                    "mae": float(mae),
+                    "train_r_squared": float(r2_score(y_train, y_pred_train)),
+                    "train_mse": float(mean_squared_error(y_train, y_pred_train)),
+                    "train_rmse": float(np.sqrt(mean_squared_error(y_train, y_pred_train))),
+                    "train_mae": float(mean_absolute_error(y_train, y_pred_train)),
+                    "training_time_seconds": float(time.time() - start_time)
+                },
+                "coefficients": coefficients,
+                "p_values": p_values,
+                "n_samples": int(len(data)),
+                "n_features": int(len(feature_names))
+            }
+            
+            # Serialize model
+            model_path = self.model_dir / f"{model_id}.joblib"
+            await asyncio.to_thread(joblib.dump, model_bundle, model_path)
+            
+            # Store in memory
+            async with self._lock:
+                self._models[model_id] = model_bundle
+            
+            logger.info(f"Model {model_id} trained successfully in {time.time() - start_time:.2f}s")
+            
+            return {
+                "model_id": model_id,
+                "timestamp": datetime.now().isoformat(),
+                "metrics": model_bundle["metrics"],
+                "coefficients": coefficients,
+                "p_values": p_values,
+                "r_squared": float(r_squared),
+                "adjusted_r_squared": float(statsmodels_model.rsquared_adj),
+                "mse": float(mse),
+                "rmse": float(rmse),
+                "mae": float(mae),
+                "n_samples": int(len(data)),
+                "n_features": int(len(feature_names)),
+                "model_path": str(model_path)
+            }
+            
+        except Exception as e:
+            logger.error(f"Model training failed: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Model training failed: {str(e)}")
+    
+    async def predict(self, model_id: str, features: Dict[str, float]) -> float:
+        """Make prediction using a trained model."""
+        try:
+            # Get model from memory or load from disk
+            async with self._lock:
+                model_bundle = self._models.get(model_id)
+            
+            if model_bundle is None:
+                model_path = self.model_dir / f"{model_id}.joblib"
+                if not model_path.exists():
+                    raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
+                model_bundle = await asyncio.to_thread(joblib.load, model_path)
+                async with self._lock:
+                    self._models[model_id] = model_bundle
+            
+            # Prepare feature vector
+            feature_names = model_bundle["feature_names"]
+            feature_vector = []
+            
+            for feature in feature_names:
+                if feature not in features:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Missing feature '{feature}' for prediction"
+                    )
+                feature_vector.append(features[feature])
+            
+            # Make prediction
+            sklearn_model = model_bundle["sklearn_model"]
+            prediction = await asyncio.to_thread(
+                sklearn_model.predict, [feature_vector]
+            )
+            
+            logger.info(f"Prediction made with model {model_id}")
+            return float(prediction[0])
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Prediction failed: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+    
+    async def list_models(self) -> List[Dict[str, Any]]:
+        """List all available models."""
+        models = []
+        for model_file in self.model_dir.glob("*.joblib"):
+            try:
+                model_bundle = await asyncio.to_thread(joblib.load, model_file)
+                models.append({
+                    "model_id": model_bundle["model_id"],
+                    "training_date": model_bundle["training_date"],
+                    "metrics": model_bundle["metrics"],
+                    "n_features": model_bundle["n_features"]
+                })
+            except Exception as e:
+                logger.warning(f"Failed to load model {model_file}: {str(e)}")
+        return models
+    
+    async def delete_model(self, model_id: str) -> bool:
+        """Delete a model."""
+        model_path = self.model_dir / f"{model_id}.joblib"
         
         async with self._lock:
-            try:
-                logger.info(f"Starting training with target={target_column}, test_size={test_size}")
-                
-                # Validate data
-                if data.empty:
-                    raise ValueError("Data is empty")
-                
-                if target_column not in data.columns:
-                    raise ValueError(f"Target column '{target_column}' not found in data")
-                
-                # Prepare features
-                if feature_columns is None:
-                    feature_columns = [col for col in data.columns if col != target_column]
-                else:
-                    missing_cols = set(feature_columns) - set(data.columns)
-                    if missing_cols:
-                        raise ValueError(f"Missing feature columns: {missing_cols}")
-                
-                if not feature_columns:
-                    raise ValueError("No feature columns available for training")
-                
-                # Extract data
-                X = data[feature_columns].copy()
-                y = data[target_column].copy()
-                
-                # Check for non-numeric data
-                if not all(pd.api.types.is_numeric_dtype(X[col]) for col in X.columns):
-                    raise ValueError("All feature columns must be numeric")
-                if not pd.api.types.is_numeric_dtype(y):
-                    raise ValueError("Target column must be numeric")
-                
-                # Handle missing values
-                if X.isnull().any().any() or y.isnull().any():
-                    logger.warning("Missing values detected, dropping rows")
-                    mask = X.notnull().all(axis=1) & y.notnull()
-                    X = X[mask]
-                    y = y[mask]
-                
-                if len(X) < 10:
-                    raise ValueError("Insufficient data after cleaning (minimum 10 rows required)")
-                
-                # Split data
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, test_size=test_size, random_state=random_state
-                )
-                
-                # Train sklearn model
-                sklearn_model = LinearRegression()
-                sklearn_model.fit(X_train, y_train)
-                
-                # Predictions
-                y_pred_train = sklearn_model.predict(X_train)
-                y_pred_test = sklearn_model.predict(X_test)
-                
-                # Compute metrics
-                metrics = {
-                    "r2_train": float(r2_score(y_train, y_pred_train)),
-                    "r2_test": float(r2_score(y_test, y_pred_test)),
-                    "mse_train": float(mean_squared_error(y_train, y_pred_train)),
-                    "mse_test": float(mean_squared_error(y_test, y_pred_test)),
-                    "mae_train": float(mean_absolute_error(y_train, y_pred_train)),
-                    "mae_test": float(mean_absolute_error(y_test, y_pred_test)),
-                    "rmse_train": float(np.sqrt(mean_squared_error(y_train, y_pred_train))),
-                    "rmse_test": float(np.sqrt(mean_squared_error(y_test, y_pred_test))),
-                    "n_samples": int(len(X)),
-                    "n_features": int(X.shape[1]),
-                    "n_train_samples": int(len(X_train)),
-                    "n_test_samples": int(len(X_test))
-                }
-                
-                # Statsmodels diagnostics
-                X_with_const = add_constant(X)
-                statsmodels_model = OLS(y, X_with_const).fit()
-                
-                # Extract coefficients and p-values
-                coefficients = {}
-                p_values = {}
-                for i, col in enumerate(feature_columns):
-                    coefficients[col] = float(sklearn_model.coef_[i])
-                    p_values[col] = float(statsmodels_model.pvalues[i + 1])  # +1 for constant
-                
-                # Intercept
-                coefficients["intercept"] = float(sklearn_model.intercept_)
-                p_values["intercept"] = float(statsmodels_model.pvalues[0])
-                
-                # Additional diagnostics
-                residuals = y - sklearn_model.predict(X)
-                
-                # Durbin-Watson statistic
-                dw_stat = durbin_watson(residuals)
-                
-                # Breusch-Pagan test for heteroscedasticity
-                try:
-                    bp_test = het_breuschpagan(residuals, X_with_const)
-                    bp_stat, bp_pvalue, bp_fvalue, bp_fpvalue = bp_test
-                except Exception as e:
-                    logger.warning(f"Breusch-Pagan test failed: {e}")
-                    bp_stat, bp_pvalue, bp_fvalue, bp_fpvalue = None, None, None, None
-                
-                # Shapiro-Wilk test for normality of residuals
-                try:
-                    shapiro_stat, shapiro_pvalue = stats.shapiro(residuals)
-                except Exception as e:
-                    logger.warning(f"Shapiro-Wilk test failed: {e}")
-                    shapiro_stat, shapiro_pvalue = None, None
-                
-                diagnostics = {
-                    "coefficients": coefficients,
-                    "p_values": p_values,
-                    "standard_errors": {col: float(statsmodels_model.bse[i + 1]) for i, col in enumerate(feature_columns)},
-                    "confidence_intervals": {
-                        col: statsmodels_model.conf_int()[i + 1].tolist() 
-                        for i, col in enumerate(feature_columns)
-                    },
-                    "aic": float(statsmodels_model.aic),
-                    "bic": float(statsmodels_model.bic),
-                    "f_statistic": float(statsmodels_model.fvalue),
-                    "f_pvalue": float(statsmodels_model.f_pvalue),
-                    "durbin_watson": float(dw_stat),
-                    "breusch_pagan": {
-                        "statistic": float(bp_stat) if bp_stat is not None else None,
-                        "pvalue": float(bp_pvalue) if bp_pvalue is not None else None
-                    },
-                    "shapiro_wilk": {
-                        "statistic": float(shapiro_stat) if shapiro_stat is not None else None,
-                        "pvalue": float(shapiro_pvalue) if shapiro_pvalue is not None else None
-                    },
-                    "residual_mean": float(np.mean(residuals)),
-                    "residual_std": float(np.std(residuals)),
-                    "adjusted_r2": float(statsmodels_model.rsquared_adj)
-                }
-                
-                # Feature importance (absolute coefficient values)
-                feature_importance = {
-                    col: abs(float(coef)) for col, coef in zip(feature_columns, sklearn_model.coef_)
-                }
-                # Normalize to percentages
-                total_importance = sum(feature_importance.values())
-                if total_importance > 0:
-                    feature_importance = {
-                        col: (val / total_importance) * 100 
-                        for col, val in feature_importance.items()
-                    }
-                
-                # Generate model ID
-                model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{random_state}"
-                model_path = self.model_dir / f"{model_id}.joblib"
-                
-                # Package model artifacts
-                model_artifacts = {
-                    "sklearn_model": sklearn_model,
-                    "statsmodels_model": statsmodels_model,
-                    "feature_columns": feature_columns,
-                    "target_column": target_column,
-                    "model_metadata": {
-                        "model_id": model_id,
-                        "training_date": datetime.now().isoformat(),
-                        "metrics": metrics,
-                        "diagnostics": diagnostics,
-                        "feature_importance": feature_importance
-                    }
-                }
-                
-                # Save model
-                await asyncio.to_thread(joblib.dump, model_artifacts, model_path)
-                logger.info(f"Model saved to {model_path}")
-                
-                return {
-                    "model_id": model_id,
-                    "metrics": metrics,
-                    "diagnostics": diagnostics,
-                    "feature_importance": feature_importance,
-                    "training_timestamp": datetime.now().isoformat(),
-                    "model_path": str(model_path)
-                }
-                
-            except Exception as e:
-                logger.error(f"Training failed: {str(e)}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+            self._models.pop(model_id, None)
+        
+        if model_path.exists():
+            await asyncio.to_thread(model_path.unlink)
+            logger.info(f"Model {model_id} deleted")
+            return True
+        else:
+            logger.warning(f"Model {model_id} not found for deletion")
+            return False
 
 
-# Initialize FastAPI app and model manager
+# ==================== API ====================
 app = FastAPI(
     title="Regression API Service",
-    description="Production-grade API for training and serving regression models",
+    description="Production-grade service for training and serving regression models",
     version="1.0.0"
 )
+
 model_manager = ModelManager()
 
 
 @app.get("/health")
 async def health_check() -> Dict[str, str]:
     """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "regression-api-service"
+    }
 
 
 @app.post("/train", response_model=TrainingResponse)
 async def train_model(
-    file: UploadFile = File(..., description="CSV file containing training data"),
+    file: UploadFile = File(..., description="CSV file with training data"),
     target_column: str = File(..., description="Name of the target column"),
     test_size: float = File(0.2, description="Test set proportion (0.1-0.5)"),
-    random_state: int = File(42, description="Random seed"),
-    feature_columns: Optional[str] = File(None, description="Comma-separated feature columns")
-) -> Dict[str, Any]:
-    """
-    Train a regression model from uploaded CSV data.
-    
-    Args:
-        file: CSV file upload
-        target_column: Name of the target column
-        test_size: Proportion of data for testing (0.1-0.5)
-        random_state: Random seed for reproducibility
-        feature_columns: Optional comma-separated list of feature columns
-    
-    Returns:
-        TrainingResponse with model metrics and diagnostics
-    """
+    random_state: int = File(42, description="Random seed")
+) -> TrainingResponse:
+    """Train a regression model from CSV data."""
     try:
-        # Validate file extension
-        filename = file.filename or ""
-        file_ext = Path(filename).suffix.lower()
-        if file_ext not in SUPPORTED_EXTENSIONS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type. Supported: {SUPPORTED_EXTENSIONS}"
-            )
-        
-        # Read file content with size limit
-        content = await file.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)} MB"
-            )
-        
-        # Parse feature columns
-        feature_list = None
-        if feature_columns:
-            feature_list = [col.strip() for col in feature_columns.split(",") if col.strip()]
-        
-        # Validate request parameters
-        try:
-            request = TrainingRequest(
-                target_column=target_column,
-                test_size=test_size,
-                random_state=random_state,
-                feature_columns=feature_list
-            )
-        except ValidationError as e:
-            raise HTTPException(status_code=422, detail=str(e))
-        
-        # Parse CSV data
-        try:
-            data = pd.read_csv(io.BytesIO(content))
-            logger.info(f"Loaded CSV with {len(data)} rows and {len(data.columns)} columns")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {str(e)}")
-        
-        # Train model
-        result = await model_manager.train_and_save(
-            data=data,
-            target_column=request.target_column,
-            test_size=request.test_size,
-            random_state=request.random_state,
-            feature_columns=request.feature_columns
+        # Validate parameters
+        request_data = TrainingRequest(
+            target_column=target_column,
+            test_size=test_size,
+            random_state=random_state
         )
         
-        return result
+        # Read CSV data
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        # Parse CSV with error handling
+        try:
+            data = pd.read_csv(io.BytesIO(content))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid CSV format: {str(e)}")
+        
+        if data.empty:
+            raise HTTPException(status_code=400, detail="CSV file contains no data")
+        
+        # Train model
+        result = await model_manager.train_model(
+            data=data,
+            target_column=request_data.target_column,
+            test_size=request_data.test_size,
+            random_state=request_data.random_state
+        )
+        
+        return TrainingResponse(**result)
+        
+    except ValidationError as e:
+        logger.error(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=422, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during training: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+
+
+@app.post("/predict/{model_id}", response_model=PredictionResponse)
+async def predict(
+    model_id: str,
+    request: PredictionRequest
+) -> PredictionResponse:
+    """Make prediction using a trained model."""
+    try:
+        prediction = await model_manager.predict(model_id, request.features)
+        
+        return PredictionResponse(
+            prediction=prediction,
+            model_id=model_id,
+            timestamp=datetime.now().isoformat()
+        )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in training endpoint: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Prediction error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
-@app.get("/models/{model_id}")
-async def get_model_info(model_id: str) -> Dict[str, Any]:
-    """Get information about a trained model."""
+@app.get("/models")
+async def list_models() -> Dict[str, Any]:
+    """List all trained models."""
     try:
-        model_path = MODEL_DIR / f"{model_id}.joblib"
-        if not model_path.exists():
+        models = await model_manager.list_models()
+        return {
+            "count": len(models),
+            "models": models,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Failed to list models: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list models: {str(e)}")
+
+
+@app.delete("/models/{model_id}")
+async def delete_model(model_id: str) -> Dict[str, Any]:
+    """Delete a trained model."""
+    try:
+        deleted = await model_manager.delete_model(model_id)
+        if not deleted:
             raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
         
-        model_artifacts = await asyncio.to_thread(joblib.load, model_path)
-        metadata = model_artifacts.get("model_metadata", {})
-        
         return {
+            "status": "deleted",
             "model_id": model_id,
-            "metadata": metadata,
-            "model_path": str(model_path)
+            "timestamp": datetime.now().isoformat()
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error loading model info: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+        logger.error(f"Failed to delete model: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to delete model: {str(e)}")
 
 
-@app.get("/models")
-async def list_models() -> Dict[str, List[str]]:
-    """List all trained models."""
-    try:
-        model_files = list(MODEL_DIR.glob("*.joblib"))
-        model_ids = [f.stem for f in model_files]
-        return {"models": model_ids, "count": len(model_ids)}
-    except Exception as e:
-        logger.error(f"Error listing models: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to list models: {str(e)}")
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "timestamp": datetime.now().isoformat()
+        }
+    )
 
 
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Regression API Service starting up")
+    # Ensure model directory exists
+    Path("models").mkdir(exist_ok=True)
+
+
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Regression API Service shutting down")
+
+
+# ==================== Main entry point ====================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-# Phase 1: Core Model Training and Serialization - iteration 3
-
-# Phase 1: Core Model Training and Serialization - iteration 4
+    
+    uvicorn.run(
+        "api:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
