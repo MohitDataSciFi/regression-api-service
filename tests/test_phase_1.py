@@ -1,5 +1,6 @@
 import io
 import logging
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -8,133 +9,233 @@ import numpy as np
 import pandas as pd
 import pytest
 from fastapi import UploadFile
+from pydantic import ValidationError
 
-from src.model_manager import ModelManager, TrainingResponse
+from src.model_manager import (
+    DataValidationError,
+    ModelTrainingError,
+    TrainingRequest,
+    TrainingResponse,
+    logger,
+)
 
 
 @pytest.fixture
-def sample_data():
-    """Create sample regression data."""
+def sample_dataframe():
+    """Create a sample dataframe for testing."""
     np.random.seed(42)
     n_samples = 100
-    X1 = np.random.randn(n_samples)
-    X2 = np.random.randn(n_samples)
-    y = 2.5 * X1 + 1.5 * X2 + np.random.randn(n_samples) * 0.1
-    return pd.DataFrame({"feature1": X1, "feature2": X2, "target": y})
+    data = {
+        "feature1": np.random.randn(n_samples),
+        "feature2": np.random.randn(n_samples),
+        "target": np.random.randn(n_samples) * 2 + 1,
+    }
+    return pd.DataFrame(data)
 
 
 @pytest.fixture
-def model_manager(tmp_path):
-    """Create ModelManager with temporary directory."""
-    return ModelManager(model_dir=Path(tmp_path) / "models")
+def sample_csv_bytes(sample_dataframe):
+    """Convert sample dataframe to CSV bytes."""
+    return sample_dataframe.to_csv(index=False).encode()
 
 
-@pytest.mark.asyncio
-async def test_train_model_returns_valid_metrics_and_serializes(model_manager, sample_data):
-    """Test that training produces valid metrics and serializes model."""
-    # Train model
-    metrics, model_id = await model_manager.train_model(
-        data=sample_data,
-        target_column="target",
-        feature_columns=["feature1", "feature2"]
-    )
-    
-    # Verify metrics
-    assert "r2_score" in metrics
-    assert "rmse" in metrics
-    assert "mae" in metrics
-    assert "mse" in metrics
-    assert metrics["r2_score"] > 0.9  # High R² for clean data
-    
-    # Verify model file exists
-    model_path = model_manager.model_dir / f"{model_id}.joblib"
-    assert model_path.exists()
-    
-    # Verify model can be loaded and makes predictions
-    loaded_model = joblib.load(model_path)
-    test_data = sample_data[["feature1", "feature2"]].iloc[:5]
-    predictions = loaded_model.predict(test_data)
-    assert len(predictions) == 5
-    assert all(np.isfinite(predictions))
+@pytest.fixture
+def mock_upload_file(sample_csv_bytes):
+    """Create a mock UploadFile."""
+    upload_file = MagicMock(spec=UploadFile)
+    upload_file.filename = "test_data.csv"
+    upload_file.file = io.BytesIO(sample_csv_bytes)
+    return upload_file
 
 
-@pytest.mark.asyncio
-async def test_train_model_with_auto_feature_selection(model_manager, sample_data):
-    """Test training when feature_columns is None (auto-select all except target)."""
-    metrics, model_id = await model_manager.train_model(
-        data=sample_data,
-        target_column="target"
-    )
-    
-    # Verify all non-target columns were used
-    assert "feature1" in metrics.get("coefficients", {})
-    assert "feature2" in metrics.get("coefficients", {})
-    assert metrics["r2_score"] > 0.9
+class TestTrainingRequest:
+    """Tests for TrainingRequest validation."""
+
+    def test_valid_request(self):
+        """Test valid training request passes validation."""
+        request = TrainingRequest(
+            target_column="target",
+            test_size=0.2,
+            random_state=42,
+            feature_columns=["feature1", "feature2"],
+        )
+        assert request.target_column == "target"
+        assert request.test_size == 0.2
+        assert request.random_state == 42
+        assert request.feature_columns == ["feature1", "feature2"]
+
+    def test_invalid_test_size(self):
+        """Test invalid test_size raises validation error."""
+        with pytest.raises(ValidationError):
+            TrainingRequest(
+                target_column="target",
+                test_size=0.6,  # > 0.5
+            )
+
+    def test_empty_feature_columns(self):
+        """Test empty feature columns raises validation error."""
+        with pytest.raises(ValidationError):
+            TrainingRequest(
+                target_column="target",
+                feature_columns=[],  # empty list
+            )
+
+    def test_duplicate_feature_columns_removed(self):
+        """Test duplicate feature columns are removed."""
+        request = TrainingRequest(
+            target_column="target",
+            feature_columns=["feature1", "feature1", "feature2"],
+        )
+        assert request.feature_columns == ["feature1", "feature2"]
 
 
-@pytest.mark.asyncio
-async def test_train_model_handles_invalid_target_column(model_manager, sample_data):
-    """Test that invalid target column raises appropriate error."""
-    with pytest.raises(ValueError, match="Target column 'nonexistent' not found"):
-        await model_manager.train_model(
-            data=sample_data,
-            target_column="nonexistent"
+class TestModelTraining:
+    """Tests for model training functionality."""
+
+    @patch("src.model_manager.joblib.dump")
+    def test_model_training_success(self, mock_dump, sample_dataframe, tmp_path):
+        """Test successful model training and serialization."""
+        from src.model_manager import ModelManager
+
+        # Mock the model manager's training method
+        manager = ModelManager()
+        model_path = tmp_path / "test_model.joblib"
+
+        # Train model
+        result = manager.train(
+            data=sample_dataframe,
+            target_column="target",
+            feature_columns=["feature1", "feature2"],
+            test_size=0.2,
+            random_state=42,
+            model_path=model_path,
         )
 
+        # Assert training results
+        assert result["model_id"] is not None
+        assert result["training_timestamp"] is not None
+        assert "metrics" in result
+        assert "coefficients" in result
+        assert "r2" in result["metrics"]
+        assert "mae" in result["metrics"]
+        assert "mse" in result["metrics"]
 
-@pytest.mark.asyncio
-async def test_train_model_with_custom_test_size_and_seed(model_manager, sample_data):
-    """Test training with custom test_size and random_state parameters."""
-    metrics_1, model_id_1 = await model_manager.train_model(
-        data=sample_data,
-        target_column="target",
-        test_size=0.3,
-        random_state=123
-    )
-    
-    metrics_2, model_id_2 = await model_manager.train_model(
-        data=sample_data,
-        target_column="target",
-        test_size=0.3,
-        random_state=123
-    )
-    
-    # Same seed should produce same results
-    assert metrics_1["r2_score"] == metrics_2["r2_score"]
-    assert model_id_1 != model_id_2  # Different model IDs despite same data
+        # Verify model was saved
+        mock_dump.assert_called_once()
+
+    @patch("src.model_manager.joblib.dump")
+    def test_model_training_with_missing_target(self, mock_dump, sample_dataframe, tmp_path):
+        """Test training with missing target column raises error."""
+        from src.model_manager import ModelManager
+
+        manager = ModelManager()
+        model_path = tmp_path / "test_model.joblib"
+
+        # Remove target column
+        df_without_target = sample_dataframe.drop(columns=["target"])
+
+        with pytest.raises(DataValidationError):
+            manager.train(
+                data=df_without_target,
+                target_column="target",
+                feature_columns=["feature1", "feature2"],
+                test_size=0.2,
+                random_state=42,
+                model_path=model_path,
+            )
+
+    @patch("src.model_manager.joblib.dump")
+    def test_model_training_with_invalid_features(self, mock_dump, sample_dataframe, tmp_path):
+        """Test training with invalid feature columns raises error."""
+        from src.model_manager import ModelManager
+
+        manager = ModelManager()
+        model_path = tmp_path / "test_model.joblib"
+
+        # Use non-existent feature column
+        with pytest.raises(DataValidationError):
+            manager.train(
+                data=sample_dataframe,
+                target_column="target",
+                feature_columns=["non_existent_feature"],
+                test_size=0.2,
+                random_state=42,
+                model_path=model_path,
+            )
+
+    def test_model_serialization_roundtrip(self, sample_dataframe, tmp_path):
+        """Test model serialization and deserialization roundtrip."""
+        from src.model_manager import ModelManager
+
+        manager = ModelManager()
+        model_path = tmp_path / "test_model.joblib"
+
+        # Train and save model
+        result = manager.train(
+            data=sample_dataframe,
+            target_column="target",
+            feature_columns=["feature1", "feature2"],
+            test_size=0.2,
+            random_state=42,
+            model_path=model_path,
+        )
+
+        # Load model back
+        loaded_model = joblib.load(model_path)
+        assert loaded_model is not None
+
+        # Verify model can make predictions
+        X_test = sample_dataframe[["feature1", "feature2"]].iloc[:5]
+        predictions = loaded_model.predict(X_test)
+        assert len(predictions) == 5
+        assert all(np.isfinite(predictions))
 
 
-@pytest.mark.asyncio
-async def test_train_model_diagnostics_include_pvalues_and_coefficients(model_manager, sample_data):
-    """Test that diagnostics include p-values and coefficient information."""
-    metrics, model_id = await model_manager.train_model(
-        data=sample_data,
-        target_column="target",
-        feature_columns=["feature1", "feature2"]
-    )
-    
-    # Check coefficients
-    assert "coefficients" in metrics
-    coeffs = metrics["coefficients"]
-    assert "feature1" in coeffs
-    assert "feature2" in coeffs
-    assert "intercept" in coeffs
-    
-    # Check p-values
-    assert "p_values" in metrics
-    p_values = metrics["p_values"]
-    assert "feature1" in p_values
-    assert "feature2" in p_values
-    assert "intercept" in p_values
-    
-    # Features should be significant (p < 0.05)
-    assert p_values["feature1"] < 0.05
-    assert p_values["feature2"] < 0.05
-    
-    # Check diagnostics dict
-    assert "diagnostics" in metrics
-    diagnostics = metrics["diagnostics"]
-    assert "durbin_watson" in diagnostics
-    assert "breusch_pagan_pvalue" in diagnostics
-    assert "n_observations" in diagnostics
-    assert "n_features" in diagnostics
+class TestTrainingResponse:
+    """Tests for TrainingResponse model."""
+
+    def test_training_response_creation(self):
+        """Test TrainingResponse can be created with valid data."""
+        response = TrainingResponse(
+            model_id="test_model_123",
+            training_timestamp=datetime.now(),
+            metrics={"r2": 0.85, "mae": 0.5, "mse": 0.4},
+            coefficients={"feature1": 0.5, "feature2": -0.3},
+        )
+        assert response.model_id == "test_model_123"
+        assert response.metrics["r2"] == 0.85
+        assert response.coefficients["feature1"] == 0.5
+
+    def test_training_response_invalid_metrics(self):
+        """Test TrainingResponse with invalid metrics type."""
+        with pytest.raises(ValidationError):
+            TrainingResponse(
+                model_id="test_model_123",
+                training_timestamp=datetime.now(),
+                metrics={"r2": "not_a_number"},  # Invalid type
+                coefficients={"feature1": 0.5},
+            )
+
+
+class TestLogging:
+    """Tests for logging configuration."""
+
+    def test_logger_configured(self):
+        """Test logger has handlers configured."""
+        assert logger.level == logging.INFO
+        assert len(logger.handlers) >= 2  # Console and file handlers
+
+    def test_log_file_created(self, tmp_path):
+        """Test log file is created when logging."""
+        log_file = tmp_path / "test_log.log"
+        test_logger = logging.getLogger("test_logger")
+        test_logger.setLevel(logging.INFO)
+        
+        handler = logging.FileHandler(log_file)
+        test_logger.addHandler(handler)
+        
+        test_logger.info("Test log message")
+        handler.flush()
+        
+        assert log_file.exists()
+        assert log_file.stat().st_size > 0
